@@ -8,7 +8,9 @@ type TurnResult = {
   source: 'tokens' | 'estimate';
   tokens: number;
   chars: number;
-  durationMs: number;
+  activeMs: number;
+  wallMs: number;
+  pausedMs: number;
   endedAt: number;
 };
 
@@ -27,6 +29,7 @@ type RateResponse = {
   lastTurn: TurnResult | null;
   eventsSeen: number;
   lastEventType: string | null;
+  waiting: 'permission' | 'question' | null;
 };
 
 type HostContext = {
@@ -60,6 +63,10 @@ const COPY = {
     lastTurnEstimated: 'estimated',
     lastTurnPending: 'measuring',
     events: 'Events seen',
+    waitingPermission: 'waiting for permission',
+    waitingQuestion: 'waiting for answer',
+    paused: 'paused',
+    active: 'generating',
   },
   ko: {
     title: 'TPS 측정기',
@@ -85,6 +92,10 @@ const COPY = {
     lastTurnEstimated: '추정',
     lastTurnPending: '측정 중',
     events: '수신 이벤트',
+    waitingPermission: '권한 대기 중',
+    waitingQuestion: '응답 대기 중',
+    paused: '대기',
+    active: '생성',
   },
 } as const;
 
@@ -169,6 +180,8 @@ const statusLabel = (rate: RateResponse | null): { label: string; tone: 'neutral
   if (rate.connection === 'error') return { label: copy.reconnecting, tone: 'warning' };
   if (rate.connection === 'connecting') return { label: copy.connecting, tone: 'neutral' };
   if (rate.connection === 'idle') return { label: copy.asleep, tone: 'neutral' };
+  if (rate.waiting === 'permission') return { label: copy.waitingPermission, tone: 'warning' };
+  if (rate.waiting === 'question') return { label: copy.waitingQuestion, tone: 'warning' };
   if (rate.active && rate.busy) return { label: copy.generating, tone: 'success' };
   return { label: copy.idle, tone: 'neutral' };
 };
@@ -181,13 +194,17 @@ const formatAge = (lastEventAt: number | null): string => {
 
 const formatCount = (value: number): string => Math.round(value).toLocaleString();
 
+const formatSeconds = (ms: number): string => `${(ms / 1000).toFixed(1)} s`;
+
 const renderLastTurn = (rate: RateResponse | null): void => {
   const turn = rate?.lastTurn ?? null;
   if (turn) {
     lastTurnValueEl.textContent = `${turn.tokensPerSecond.toFixed(1)} ${copy.unit}`;
     lastTurnValueEl.dataset.state = 'ready';
-    const suffix = turn.source === 'estimate' ? ` · ${copy.lastTurnEstimated}` : '';
-    lastTurnMetaEl.textContent = `${formatCount(turn.tokens)} tok · ${(turn.durationMs / 1000).toFixed(1)} s${suffix}`;
+    const parts = [`${formatCount(turn.tokens)} tok`, `${formatSeconds(turn.activeMs)} (${copy.active})`];
+    if (turn.pausedMs >= 1000) parts.push(`${copy.paused} ${formatSeconds(turn.pausedMs)}`);
+    if (turn.source === 'estimate') parts.push(copy.lastTurnEstimated);
+    lastTurnMetaEl.textContent = parts.join(' · ');
     return;
   }
   const measuring = Boolean(rate?.busy);

@@ -15,6 +15,7 @@ var MIN_CHARS_PER_TOKEN = 0.05;
 var MAX_CHARS_PER_TOKEN = 1;
 var CALIBRATION_WEIGHT = 0.3;
 var MIN_CALIBRATION_CHARS = 40;
+var MAX_STREAM_GAP_MS = 1000;
 var samples = [];
 var partChars = new Map;
 var deltaParts = new Set;
@@ -32,10 +33,24 @@ var retryTimer = null;
 var retryDelay = RETRY_BASE_MS;
 var turnStartedAt = null;
 var turnLastCharAt = null;
+var turnBusyAt = null;
 var turnChars = 0;
 var turnTokens = 0;
+var turnActiveMs = 0;
 var turnTokenMessages = new Set;
 var lastTurn = null;
+var pendingPermissions = new Set;
+var pendingQuestions = new Set;
+var waitingKind = () => pendingPermissions.size > 0 ? "permission" : pendingQuestions.size > 0 ? "question" : null;
+var clearTurn = () => {
+  turnStartedAt = null;
+  turnLastCharAt = null;
+  turnBusyAt = null;
+  turnChars = 0;
+  turnTokens = 0;
+  turnActiveMs = 0;
+  turnTokenMessages.clear();
+};
 var resetMeasurement = () => {
   samples.length = 0;
   partChars.clear();
@@ -43,38 +58,31 @@ var resetMeasurement = () => {
   messageChars.clear();
   lastEventAt = 0;
   busy = false;
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnChars = 0;
-  turnTokens = 0;
-  turnTokenMessages.clear();
+  clearTurn();
+  pendingPermissions.clear();
+  pendingQuestions.clear();
   lastTurn = null;
 };
 var finalizeTurn = (now) => {
   if (turnStartedAt === null || turnLastCharAt === null || turnChars === 0) {
-    turnStartedAt = null;
-    turnLastCharAt = null;
-    turnChars = 0;
-    turnTokens = 0;
-    turnTokenMessages.clear();
+    clearTurn();
     return;
   }
-  const durationMs = Math.max(1, turnLastCharAt - turnStartedAt);
+  const wallMs = Math.max(1, turnLastCharAt - turnStartedAt);
+  const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
   const source = turnTokenMessages.size > 0 ? "tokens" : "estimate";
   const tokens = source === "tokens" ? turnTokens : turnChars * charsPerToken;
   lastTurn = {
-    tokensPerSecond: tokens / (durationMs / 1000),
+    tokensPerSecond: tokens / (activeMs / 1000),
     source,
     tokens,
     chars: turnChars,
-    durationMs,
+    activeMs,
+    wallMs,
+    pausedMs: Math.max(0, wallMs - activeMs),
     endedAt: now
   };
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnChars = 0;
-  turnTokens = 0;
-  turnTokenMessages.clear();
+  clearTurn();
 };
 var pruneSamples = (now) => {
   let expired = 0;
@@ -93,8 +101,16 @@ var recordChars = (messageID, partID, chars, now) => {
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
   lastEventAt = now;
-  if (turnStartedAt === null)
+  if (turnStartedAt === null) {
     turnStartedAt = now;
+    if (turnBusyAt !== null && now - turnBusyAt <= MAX_STREAM_GAP_MS) {
+      turnActiveMs += now - turnBusyAt;
+    }
+  } else if (turnLastCharAt !== null && waitingKind() === null) {
+    const gap = now - turnLastCharAt;
+    if (gap <= MAX_STREAM_GAP_MS)
+      turnActiveMs += gap;
+  }
   turnLastCharAt = now;
   turnChars += chars;
 };
@@ -167,6 +183,42 @@ var handleEvent = (event, now) => {
     }
     return;
   }
+  if (type === "permission.asked" || type === "permission.v2.asked") {
+    if (!isWatchedSession(properties.sessionID))
+      return;
+    const requestId = readString(properties.id);
+    if (requestId)
+      pendingPermissions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+  if (type === "permission.replied" || type === "permission.v2.replied") {
+    if (!isWatchedSession(properties.sessionID))
+      return;
+    const requestId = readString(properties.requestID);
+    if (requestId)
+      pendingPermissions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
+  if (type === "question.asked" || type === "question.v2.asked") {
+    if (!isWatchedSession(properties.sessionID))
+      return;
+    const requestId = readString(properties.id);
+    if (requestId)
+      pendingQuestions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+  if (type === "question.replied" || type === "question.rejected" || type === "question.v2.replied" || type === "question.v2.rejected") {
+    if (!isWatchedSession(properties.sessionID))
+      return;
+    const requestId = readString(properties.requestID);
+    if (requestId)
+      pendingQuestions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
   if (type === "session.status") {
     if (!isWatchedSession(properties.sessionID))
       return;
@@ -174,6 +226,8 @@ var handleEvent = (event, now) => {
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
+    if (nextBusy && turnStartedAt === null)
+      turnBusyAt = now;
     busy = nextBusy;
     lastEventAt = now;
     return;
@@ -390,7 +444,8 @@ var server = http.createServer((req, res) => {
       charsPerToken,
       lastTurn,
       eventsSeen,
-      lastEventType
+      lastEventType,
+      waiting: waitingKind()
     });
     return;
   }

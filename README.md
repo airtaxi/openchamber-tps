@@ -53,18 +53,33 @@ stream carries characters per delta and tokens only per completed turn.
 
 ## Turn average
 
-A turn spans the first streamed character after idle until `session.idle`, so
-its average describes generation time, not the tool waits before the first
-token or after the last one. When the turn ends the service reports:
+A turn spans the first streamed character after idle until `session.idle`. Its
+average divides tokens by generation time only:
+
+- Time between consecutive streamed characters counts as generation, up to a
+  1-second threshold. A longer gap is a pause and is excluded, which covers tool
+  execution and retries.
+- A pending permission or question excludes the wait outright, even when the
+  user answers within that threshold. OpenCode keeps the session `busy` while an
+  agent waits for the user, so `waiting-permission` and `waiting-question` are
+  detected from `permission.*` and `question.*` events, and the panel shows
+  `waiting for permission` / `waiting for answer` instead of `generating`.
+- Time to the first token is excluded when the first character arrives more than
+  a second after the turn started.
+
+When the turn ends the service reports:
 
 - `tokens`: the sum of `output + reasoning` across the turn's completed
   assistant messages, counted once per message.
-- `durationMs`: first counted character to last counted character.
-- `tokensPerSecond`: `tokens / durationMs`.
+- `activeMs`: accumulated generation time.
+- `wallMs`: first counted character to last counted character.
+- `pausedMs`: `wallMs - activeMs`, what the average left out.
+- `tokensPerSecond`: `tokens / activeMs`.
 - `source`: `tokens` when real counts existed, otherwise `estimate` from
   characters times the calibrated ratio. The panel labels the estimated case.
 
-Switching the watched session clears the stored turn.
+The panel shows the active time, and adds `paused` once a turn has excluded at
+least a second. Switching the watched session clears the stored turn.
 
 ## Build
 

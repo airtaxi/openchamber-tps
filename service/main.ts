@@ -33,6 +33,13 @@ const MAX_CHARS_PER_TOKEN = 1;
 const CALIBRATION_WEIGHT = 0.3;
 /** Ignore tiny completed turns when calibrating; they carry no signal. */
 const MIN_CALIBRATION_CHARS = 40;
+/**
+ * A gap between streamed characters longer than this is a pause, not
+ * generation: tool execution, a retry, or the agent waiting for the user. That
+ * time is excluded from the turn's average. Streamed chunks normally arrive in
+ * tens of milliseconds, so the separation is wide.
+ */
+const MAX_STREAM_GAP_MS = 1_000;
 
 type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
 
@@ -45,15 +52,22 @@ type WatchConfig = {
 
 /** The finished turn's average rate, shown after the session goes idle. */
 type TurnResult = {
-  /** Average tokens per second over the turn's generation span. */
+  /** Average tokens per second over the turn's generation time. */
   tokensPerSecond: number;
   /** `tokens` when completed message counts existed, otherwise a character estimate. */
   source: 'tokens' | 'estimate';
   tokens: number;
   chars: number;
-  durationMs: number;
+  /** Time actually spent generating: gaps between streamed characters, pauses excluded. */
+  activeMs: number;
+  /** First character to last character, pauses included. */
+  wallMs: number;
+  /** `wallMs - activeMs`: tool calls, retries, and waits for the user. */
+  pausedMs: number;
   endedAt: number;
 };
+
+type WaitingKind = 'permission' | 'question';
 
 const samples: Sample[] = [];
 /** Characters seen per part id, used to diff `message.part.updated` snapshots. */
@@ -77,14 +91,36 @@ let retryTimer: NodeJS.Timeout | null = null;
 let retryDelay = RETRY_BASE_MS;
 
 // The turn in progress. A turn spans the first streamed character after idle
-// until `session.idle`, so its average describes generation, not tool waits
-// before the first token or after the last one.
+// until `session.idle`. Its average divides tokens by generation time only:
+// pauses between streamed characters, whether a tool call or a wait for the
+// user, are excluded.
 let turnStartedAt: number | null = null;
 let turnLastCharAt: number | null = null;
+let turnBusyAt: number | null = null;
 let turnChars = 0;
 let turnTokens = 0;
+let turnActiveMs = 0;
 const turnTokenMessages = new Set<string>();
 let lastTurn: TurnResult | null = null;
+// Pending permission and question requests for the watched session. OpenCode
+// keeps the session `busy` while an agent waits for the user; these sets are
+// what distinguishes generation from waiting.
+const pendingPermissions = new Set<string>();
+const pendingQuestions = new Set<string>();
+
+const waitingKind = (): WaitingKind | null => (
+  pendingPermissions.size > 0 ? 'permission' : pendingQuestions.size > 0 ? 'question' : null
+);
+
+const clearTurn = (): void => {
+  turnStartedAt = null;
+  turnLastCharAt = null;
+  turnBusyAt = null;
+  turnChars = 0;
+  turnTokens = 0;
+  turnActiveMs = 0;
+  turnTokenMessages.clear();
+};
 
 const resetMeasurement = (): void => {
   samples.length = 0;
@@ -93,39 +129,34 @@ const resetMeasurement = (): void => {
   messageChars.clear();
   lastEventAt = 0;
   busy = false;
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnChars = 0;
-  turnTokens = 0;
-  turnTokenMessages.clear();
+  clearTurn();
+  pendingPermissions.clear();
+  pendingQuestions.clear();
   lastTurn = null;
 };
 
 const finalizeTurn = (now: number): void => {
   if (turnStartedAt === null || turnLastCharAt === null || turnChars === 0) {
-    turnStartedAt = null;
-    turnLastCharAt = null;
-    turnChars = 0;
-    turnTokens = 0;
-    turnTokenMessages.clear();
+    clearTurn();
     return;
   }
-  const durationMs = Math.max(1, turnLastCharAt - turnStartedAt);
+  const wallMs = Math.max(1, turnLastCharAt - turnStartedAt);
+  // A single streamed chunk gives no gap to measure; bound the fallback by the
+  // widest gap still treated as generation.
+  const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
   const source: TurnResult['source'] = turnTokenMessages.size > 0 ? 'tokens' : 'estimate';
   const tokens = source === 'tokens' ? turnTokens : turnChars * charsPerToken;
   lastTurn = {
-    tokensPerSecond: tokens / (durationMs / 1000),
+    tokensPerSecond: tokens / (activeMs / 1000),
     source,
     tokens,
     chars: turnChars,
-    durationMs,
+    activeMs,
+    wallMs,
+    pausedMs: Math.max(0, wallMs - activeMs),
     endedAt: now,
   };
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnChars = 0;
-  turnTokens = 0;
-  turnTokenMessages.clear();
+  clearTurn();
 };
 
 const pruneSamples = (now: number): void => {
@@ -143,7 +174,21 @@ const recordChars = (messageID: string, partID: string, chars: number, now: numb
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
   lastEventAt = now;
-  if (turnStartedAt === null) turnStartedAt = now;
+
+  if (turnStartedAt === null) {
+    turnStartedAt = now;
+    // Time to the first character counts only when it looks like generation
+    // rather than a pause before the model call.
+    if (turnBusyAt !== null && now - turnBusyAt <= MAX_STREAM_GAP_MS) {
+      turnActiveMs += now - turnBusyAt;
+    }
+  } else if (turnLastCharAt !== null && waitingKind() === null) {
+    // Streaming gap, so it is generation time. A wait for the user is never
+    // generation even when the user answers within the gap threshold.
+    const gap = now - turnLastCharAt;
+    if (gap <= MAX_STREAM_GAP_MS) turnActiveMs += gap;
+  }
+
   turnLastCharAt = now;
   turnChars += chars;
 };
@@ -222,11 +267,45 @@ const handleEvent = (event: RawEvent, now: number): void => {
     return;
   }
 
+  if (type === 'permission.asked' || type === 'permission.v2.asked') {
+    if (!isWatchedSession(properties.sessionID)) return;
+    const requestId = readString(properties.id);
+    if (requestId) pendingPermissions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+
+  if (type === 'permission.replied' || type === 'permission.v2.replied') {
+    if (!isWatchedSession(properties.sessionID)) return;
+    const requestId = readString(properties.requestID);
+    if (requestId) pendingPermissions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
+
+  if (type === 'question.asked' || type === 'question.v2.asked') {
+    if (!isWatchedSession(properties.sessionID)) return;
+    const requestId = readString(properties.id);
+    if (requestId) pendingQuestions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+
+  if (type === 'question.replied' || type === 'question.rejected' || type === 'question.v2.replied' || type === 'question.v2.rejected') {
+    if (!isWatchedSession(properties.sessionID)) return;
+    const requestId = readString(properties.requestID);
+    if (requestId) pendingQuestions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
+
   if (type === 'session.status') {
     if (!isWatchedSession(properties.sessionID)) return;
     const status = properties.status as { type?: unknown } | undefined;
     const nextBusy = status?.type === 'busy' || status?.type === 'retry';
     if (busy && !nextBusy) finalizeTurn(now);
+    // Mark where the turn began so time to first token can be judged.
+    if (nextBusy && turnStartedAt === null) turnBusyAt = now;
     busy = nextBusy;
     lastEventAt = now;
     return;
@@ -453,6 +532,7 @@ const server = http.createServer((req, res) => {
       lastTurn,
       eventsSeen,
       lastEventType,
+      waiting: waitingKind(),
     });
     return;
   }

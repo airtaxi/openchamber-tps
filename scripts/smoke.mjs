@@ -127,6 +127,29 @@ try {
   assert(rate.body.busy === true, 'busy should follow session.status');
   assert(rate.body.eventsSeen > 0, 'the stream counter should grow');
   assert(typeof rate.body.lastEventType === 'string', 'the last event type should be reported');
+  assert(rate.body.waiting === null, 'no wait should be reported while generating');
+
+  // The agent asks for permission and stops generating. OpenCode keeps the
+  // session busy while it waits, so only the pause accounting keeps this out of
+  // the turn average.
+  emit({ type: 'permission.asked', properties: { id: 'perm_1', sessionID: SESSION, permission: 'bash' } });
+  await wait(400);
+  assert((await call('/rate')).body.waiting === 'permission', 'a pending permission should be reported');
+  emit({
+    type: 'message.part.delta',
+    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
+  });
+  emit({ type: 'permission.replied', properties: { sessionID: SESSION, requestID: 'perm_1', reply: 'once' } });
+  await wait(50);
+  emit({
+    type: 'message.part.delta',
+    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
+  });
+  await wait(50);
+  emit({
+    type: 'message.part.delta',
+    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
+  });
 
   // A completed turn recalibrates chars-per-token from real token counts.
   emit({
@@ -144,13 +167,20 @@ try {
   await wait(100);
   const idle = await call('/rate');
   assert(idle.body.busy === false, 'busy should clear on session.idle');
+  assert(idle.body.waiting === null, 'a resolved permission should clear the wait');
 
   const turn = idle.body.lastTurn;
   assert(turn, 'a finished turn should be reported');
   assert(turn.source === 'tokens', `expected real token counts, got ${turn.source}`);
   assert(turn.tokens === 160, `expected 160 turn tokens, got ${turn.tokens}`);
-  assert(turn.durationMs > 0, 'turn duration should be positive');
-  assert(turn.tokensPerSecond > 0, 'turn average should be positive');
+  assert(turn.chars === 520, `expected 520 counted characters, got ${turn.chars}`);
+  assert(turn.activeMs > 0, 'active time should be positive');
+  assert(turn.wallMs > turn.activeMs, 'the wait should make wall time exceed generation time');
+  assert(turn.pausedMs >= 350, `expected the wait to be excluded, paused ${turn.pausedMs} ms`);
+  assert(
+    turn.tokensPerSecond > turn.tokens / (turn.wallMs / 1000),
+    'the average should divide by generation time only',
+  );
   assert(turn.endedAt > 0, 'turn should be stamped');
 
   // Fallback path: a server that only sends growing `message.part.updated`
@@ -169,8 +199,9 @@ try {
   const fallback = await call('/rate');
   assert(fallback.body.chars === 250, `expected 250 characters from part snapshots, got ${fallback.body.chars}`);
 
+  console.log('turn:', JSON.stringify(turn));
+  console.log('fallback:', JSON.stringify(fallback.body));
   console.log('smoke: ok');
-  console.log(JSON.stringify(fallback.body, null, 2));
 } finally {
   child.kill();
   mock.close();
