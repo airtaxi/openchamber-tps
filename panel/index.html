@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TPS Meter</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+
+      body {
+        padding: 12px;
+        box-sizing: border-box;
+        background: var(--oc-bg);
+        color: var(--oc-fg);
+        font-family: var(--oc-font);
+      }
+
+      #root {
+        height: 100%;
+      }
+
+      .tps-root {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .tps-notice:empty {
+        display: none;
+      }
+
+      .tps-card {
+        border: 1px solid var(--oc-border);
+        background: var(--oc-muted-surface);
+        border-radius: var(--oc-radius);
+        padding: 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .tps-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .tps-title {
+        margin: 0;
+        font-size: 0.9375rem;
+        font-weight: 600;
+      }
+
+      .tps-readout {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+      }
+
+      .tps-value {
+        font-size: 2.75rem;
+        line-height: 1;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tps-unit {
+        color: var(--oc-muted);
+        font-size: 0.875rem;
+      }
+
+      .tps-window {
+        color: var(--oc-muted);
+        font-size: 0.8125rem;
+        margin-top: -6px;
+      }
+
+      .tps-bar {
+        height: 6px;
+        border-radius: 999px;
+        background: var(--oc-selection);
+        overflow: hidden;
+      }
+
+      .tps-bar-fill {
+        width: 100%;
+        height: 100%;
+        background: var(--oc-primary);
+        transform-origin: left center;
+        transform: scaleX(0);
+        transition: transform 160ms linear;
+      }
+
+      .tps-session-row {
+        min-height: 1.25rem;
+      }
+
+      .tps-session {
+        font-size: 0.8125rem;
+        color: var(--oc-fg);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .tps-session[data-empty='true'] {
+        color: var(--oc-muted);
+      }
+
+      .tps-details {
+        margin: 0;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 4px 12px;
+        font-size: 0.8125rem;
+      }
+
+      .tps-detail-label {
+        color: var(--oc-muted);
+      }
+
+      .tps-detail-value {
+        margin: 0;
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tps-lastturn {
+        gap: 2px;
+      }
+
+      .tps-lastturn-label {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+      }
+
+      .tps-lastturn-value {
+        font-size: 1.5rem;
+        line-height: 1.2;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tps-lastturn-value[data-state='empty'],
+      .tps-lastturn-value[data-state='pending'] {
+        color: var(--oc-muted);
+        font-size: 1rem;
+        font-weight: 500;
+      }
+
+      .tps-lastturn-meta {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+        font-variant-numeric: tabular-nums;
+        min-height: 1rem;
+      }
+
+      .tps-footer {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .tps-note {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+        line-height: 1.4;
+      }
+
+      .tps-actions {
+        display: flex;
+        justify-content: flex-end;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>
