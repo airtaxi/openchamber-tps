@@ -1,8 +1,11 @@
 // Smoke test for the TPS Meter service.
 //
 // Starts a mock OpenChamber event stream and the built service, feeds it
-// synthetic deltas, and checks the rolling rate. Run with `bun scripts/smoke.mjs`
-// or `node scripts/smoke.mjs` from the extension folder.
+// OpenCode 2 wire events (`session.text.delta`, `session.step.ended`,
+// `session.execution.*`, ...) with the same envelopes the real stream uses,
+// and checks the rolling rate, the direct token counts, and the turn average.
+// Run with `bun scripts/smoke.mjs` or `node scripts/smoke.mjs` from the
+// extension folder.
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -25,15 +28,17 @@ const mock = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store' });
-  res.write('data: {"payload":{"type":"server.connected","properties":{}},"directory":"/repo","eventId":"evt_0"}\n\n');
+  res.write('data: {"id":"evt_0","created":0,"type":"server.connected","data":{}}\n\n');
   streamClients.add(res);
   req.on('close', () => streamClients.delete(res));
 });
 
-// The real global stream wraps every event; the service must unwrap `payload`.
-const emit = (event) => {
-  const payload = `data: ${JSON.stringify({ payload: event, directory: '/repo', eventId: `evt_${Date.now()}` })}\n\n`;
-  for (const client of streamClients) client.write(payload);
+// OpenCode 2 frames are the event itself: `{ id, created, type, data }`.
+let eventSeq = 0;
+const emit = (type, data) => {
+  eventSeq += 1;
+  const frame = `data: ${JSON.stringify({ id: `evt_${eventSeq}`, created: Date.now(), type, data })}\n\n`;
+  for (const client of streamClients) client.write(frame);
 };
 
 const wait = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -97,23 +102,14 @@ try {
     `service must use the global stream, saw ${requestedPaths.join(', ')}`,
   );
 
-  emit({ type: 'session.status', properties: { sessionID: SESSION, status: { type: 'busy' } } });
+  emit('session.execution.started', { sessionID: SESSION });
 
   // 400 counted characters over ~0.5 s inside the watched session.
   for (let index = 0; index < 10; index += 1) {
-    emit({
-      type: 'message.part.delta',
-      properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
-    });
-    // Ignored: another session, and a non-text field.
-    emit({
-      type: 'message.part.delta',
-      properties: { sessionID: 'ses_other', messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'y'.repeat(500) },
-    });
-    emit({
-      type: 'message.part.delta',
-      properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_tool', field: 'input', delta: 'z'.repeat(500) },
-    });
+    emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
+    // Ignored: another session, and tool-input fragments (not generation).
+    emit('session.text.delta', { sessionID: 'ses_other', assistantMessageID: 'msg_1', ordinal: 0, delta: 'y'.repeat(500) });
+    emit('session.tool.input.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1', delta: 'z'.repeat(500) });
     await wait(50);
   }
 
@@ -124,49 +120,62 @@ try {
   assert(rate.body.chars === 400, `expected 400 counted characters, got ${rate.body.chars}`);
   assert(Math.abs(rate.body.charsPerSecond - 80) < 1, `expected ~80 chars/s, got ${rate.body.charsPerSecond}`);
   assert(rate.body.tokensPerSecond > 0, 'tokens per second should be positive');
-  assert(rate.body.busy === true, 'busy should follow session.status');
+  assert(rate.body.busy === true, 'busy should follow session.execution.started');
   assert(rate.body.eventsSeen > 0, 'the stream counter should grow');
   assert(typeof rate.body.lastEventType === 'string', 'the last event type should be reported');
   assert(rate.body.waiting === null, 'no wait should be reported while generating');
+  assert(rate.body.sessionUsage === null, 'session totals should be empty before the first settled step');
 
   // The agent asks for permission and stops generating. OpenCode keeps the
   // session busy while it waits, so only the pause accounting keeps this out of
   // the turn average.
-  emit({ type: 'permission.asked', properties: { id: 'perm_1', sessionID: SESSION, permission: 'bash' } });
+  emit('permission.asked', { id: 'per_1', sessionID: SESSION, action: 'bash' });
   await wait(400);
   assert((await call('/rate')).body.waiting === 'permission', 'a pending permission should be reported');
-  emit({
-    type: 'message.part.delta',
-    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
-  });
-  emit({ type: 'permission.replied', properties: { sessionID: SESSION, requestID: 'perm_1', reply: 'once' } });
+  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
+  emit('permission.replied', { sessionID: SESSION, requestID: 'per_1', reply: 'once' });
   await wait(50);
-  emit({
-    type: 'message.part.delta',
-    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
-  });
+  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
   await wait(50);
-  emit({
-    type: 'message.part.delta',
-    properties: { sessionID: SESSION, messageID: 'msg_1', partID: 'prt_1', field: 'text', delta: 'x'.repeat(40) },
-  });
+  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
 
-  // A completed turn recalibrates chars-per-token from real token counts.
-  emit({
-    type: 'message.updated',
-    properties: {
-      sessionID: SESSION,
-      info: { id: 'msg_1', role: 'assistant', tokens: { output: 120, reasoning: 40 }, time: { created: Date.now(), completed: Date.now() } },
-    },
+  // The question tool arrives as a form on OpenCode 2.
+  emit('form.created', { form: { id: 'frm_1', sessionID: SESSION, title: 'Pick one' } });
+  await wait(50);
+  assert((await call('/rate')).body.waiting === 'question', 'a pending form should be reported');
+  emit('form.replied', { id: 'frm_1', sessionID: SESSION, answer: {} });
+  await wait(50);
+  assert((await call('/rate')).body.waiting === null, 'a resolved form should clear the wait');
+
+  // A settled step carries the provider's real token counts and recalibrates
+  // chars-per-token.
+  emit('session.step.ended', {
+    sessionID: SESSION,
+    assistantMessageID: 'msg_1',
+    finish: 'stop',
+    cost: 0.01,
+    tokens: { input: 900, output: 120, reasoning: 40, cache: { read: 0, write: 0 } },
   });
   await wait(100);
   const calibrated = await call('/rate');
   assert(calibrated.body.charsPerToken > 0.25, `expected calibration above the default, got ${calibrated.body.charsPerToken}`);
 
-  emit({ type: 'session.idle', properties: { sessionID: SESSION } });
+  // Session-cumulative usage is reported as-is, so the panel can show real
+  // session totals next to the estimate.
+  emit('session.usage.updated', {
+    sessionID: SESSION,
+    cost: 0.02,
+    tokens: { input: 1000, output: 200, reasoning: 60, cache: { read: 0, write: 0 } },
+  });
+  await wait(100);
+  const usage = await call('/rate');
+  assert(usage.body.sessionUsage?.generated === 260, `expected 260 generated session tokens, got ${usage.body.sessionUsage?.generated}`);
+  assert(usage.body.sessionUsage?.cost === 0.02, `expected the session cost, got ${usage.body.sessionUsage?.cost}`);
+
+  emit('session.execution.succeeded', { sessionID: SESSION });
   await wait(100);
   const idle = await call('/rate');
-  assert(idle.body.busy === false, 'busy should clear on session.idle');
+  assert(idle.body.busy === false, 'busy should clear on session.execution.succeeded');
   assert(idle.body.waiting === null, 'a resolved permission should clear the wait');
 
   const turn = idle.body.lastTurn;
@@ -183,23 +192,37 @@ try {
   );
   assert(turn.endedAt > 0, 'turn should be stamped');
 
-  // Fallback path: a server that only sends growing `message.part.updated`
-  // snapshots must still count characters.
+  // Fallback path: a service that attached after the deltas went by still
+  // counts characters from the full-value `*ended` boundary.
   const secondSession = 'ses_fallback';
   await call('/watch', {
     method: 'POST',
     body: JSON.stringify({ origin: `http://127.0.0.1:${MOCK_PORT}`, sessionId: secondSession }),
   });
-  assert((await call('/rate')).body.lastTurn === null, 'watching a new session should clear the last turn');
+  const switched = await call('/rate');
+  assert(switched.body.lastTurn === null, 'watching a new session should clear the last turn');
+  assert(switched.body.sessionUsage === null, 'watching a new session should clear the session totals');
   await wait(300);
-  emit({ type: 'message.part.updated', properties: { sessionID: secondSession, part: { id: 'prt_2', messageID: 'msg_2', type: 'text', text: 'a'.repeat(100) } } });
+  emit('session.execution.started', { sessionID: secondSession });
+  emit('session.text.ended', { sessionID: secondSession, assistantMessageID: 'msg_2', ordinal: 0, text: 'a'.repeat(250) });
   await wait(50);
-  emit({ type: 'message.part.updated', properties: { sessionID: secondSession, part: { id: 'prt_2', messageID: 'msg_2', type: 'text', text: 'a'.repeat(250) } } });
-  await wait(200);
+  emit('session.text.ended', { sessionID: secondSession, assistantMessageID: 'msg_2', ordinal: 0, text: 'a'.repeat(400) });
+  await wait(100);
+  // A shutdown is not the end of the turn: the session stays busy.
+  emit('session.execution.interrupted', { sessionID: secondSession, reason: 'shutdown' });
+  await wait(50);
+  const interrupted = await call('/rate');
+  assert(interrupted.body.busy === true, 'a shutdown interruption should keep the session busy');
+  assert(interrupted.body.chars === 400, `expected 400 characters from the full-value boundary, got ${interrupted.body.chars}`);
+
+  emit('session.execution.succeeded', { sessionID: secondSession });
+  await wait(100);
   const fallback = await call('/rate');
-  assert(fallback.body.chars === 250, `expected 250 characters from part snapshots, got ${fallback.body.chars}`);
+  assert(fallback.body.busy === false, 'busy should clear after the resumed turn ends');
+  assert(fallback.body.chars === 400, `expected 400 characters from the full-value boundary, got ${fallback.body.chars}`);
 
   console.log('turn:', JSON.stringify(turn));
+  console.log('usage:', JSON.stringify(usage.body.sessionUsage));
   console.log('fallback:', JSON.stringify(fallback.body));
   console.log('smoke: ok');
 } finally {

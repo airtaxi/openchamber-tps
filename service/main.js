@@ -20,6 +20,7 @@ var samples = [];
 var partChars = new Map;
 var deltaParts = new Set;
 var messageChars = new Map;
+var stepTokens = new Map;
 var watch = null;
 var connection = "idle";
 var lastError = null;
@@ -28,6 +29,7 @@ var eventsSeen = 0;
 var lastEventType = null;
 var busy = false;
 var charsPerToken = DEFAULT_CHARS_PER_TOKEN;
+var sessionUsage = null;
 var controller = null;
 var retryTimer = null;
 var retryDelay = RETRY_BASE_MS;
@@ -37,7 +39,7 @@ var turnBusyAt = null;
 var turnChars = 0;
 var turnTokens = 0;
 var turnActiveMs = 0;
-var turnTokenMessages = new Set;
+var turnSawTokens = false;
 var lastTurn = null;
 var pendingPermissions = new Set;
 var pendingQuestions = new Set;
@@ -49,15 +51,17 @@ var clearTurn = () => {
   turnChars = 0;
   turnTokens = 0;
   turnActiveMs = 0;
-  turnTokenMessages.clear();
+  turnSawTokens = false;
 };
 var resetMeasurement = () => {
   samples.length = 0;
   partChars.clear();
   deltaParts.clear();
   messageChars.clear();
+  stepTokens.clear();
   lastEventAt = 0;
   busy = false;
+  sessionUsage = null;
   clearTurn();
   pendingPermissions.clear();
   pendingQuestions.clear();
@@ -70,7 +74,7 @@ var finalizeTurn = (now) => {
   }
   const wallMs = Math.max(1, turnLastCharAt - turnStartedAt);
   const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
-  const source = turnTokenMessages.size > 0 ? "tokens" : "estimate";
+  const source = turnSawTokens ? "tokens" : "estimate";
   const tokens = source === "tokens" ? turnTokens : turnChars * charsPerToken;
   lastTurn = {
     tokensPerSecond: tokens / (activeMs / 1000),
@@ -116,6 +120,14 @@ var recordChars = (messageID, partID, chars, now) => {
 };
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && watch !== null && watch.sessionId !== null && sessionID === watch.sessionId;
 var readString = (value) => typeof value === "string" ? value : "";
+var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
+var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+var fragmentPartID = (messageID, kind, ordinal) => {
+  if (!messageID)
+    return "";
+  const index = typeof ordinal === "number" && Number.isInteger(ordinal) && ordinal >= 0 ? ordinal : 0;
+  return `${messageID}:${kind}:${index}`;
+};
 var calibrate = (messageID, output, reasoning) => {
   const chars = messageChars.get(messageID) ?? 0;
   if (chars < MIN_CALIBRATION_CHARS)
@@ -126,103 +138,172 @@ var calibrate = (messageID, output, reasoning) => {
   const ratio = Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, generated / chars));
   charsPerToken = charsPerToken + (ratio - charsPerToken) * CALIBRATION_WEIGHT;
 };
+var recordTokens = (messageID, output, reasoning) => {
+  const generated = output + reasoning;
+  if (!messageID || generated <= 0)
+    return;
+  calibrate(messageID, output, reasoning);
+  const previous = stepTokens.get(messageID) ?? 0;
+  stepTokens.set(messageID, generated);
+  if (turnStartedAt === null)
+    return;
+  turnTokens += generated - previous;
+  if (generated > previous)
+    turnSawTokens = true;
+};
 var handleEvent = (event, now) => {
   const type = readString(event.type);
   if (!type)
     return;
-  const properties = event.properties && typeof event.properties === "object" ? event.properties : {};
-  if (type === "message.part.delta") {
-    if (!isWatchedSession(properties.sessionID))
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  if (!payload)
+    return;
+  if (type === "session.text.delta" || type === "session.reasoning.delta") {
+    if (!isWatchedSession(payload.sessionID))
       return;
-    if (readString(properties.field) !== "text")
-      return;
-    const partID = readString(properties.partID);
-    const messageID = readString(properties.messageID);
-    const delta = readString(properties.delta);
-    if (!partID || !messageID || delta.length === 0)
+    const messageID = readString(payload.assistantMessageID);
+    const delta = readString(payload.delta);
+    const kind = type === "session.reasoning.delta" ? "reasoning" : "text";
+    const partID = fragmentPartID(messageID, kind, payload.ordinal);
+    if (!partID || delta.length === 0)
       return;
     deltaParts.add(partID);
     recordChars(messageID, partID, delta.length, now);
     return;
   }
-  if (type === "message.part.updated") {
-    if (!isWatchedSession(properties.sessionID))
+  if (type === "session.text.ended" || type === "session.reasoning.ended") {
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const part = properties.part;
-    if (!part)
-      return;
-    if (part.type !== "text" && part.type !== "reasoning")
-      return;
-    const partID = readString(part.id);
-    const partText = readString(part.text);
+    const messageID = readString(payload.assistantMessageID);
+    const kind = type === "session.reasoning.ended" ? "reasoning" : "text";
+    const partID = fragmentPartID(messageID, kind, payload.ordinal);
     if (!partID)
       return;
     if (deltaParts.has(partID))
       return;
+    const text = readString(payload.text);
     const previous = partChars.get(partID) ?? 0;
-    if (partText.length <= previous)
+    if (text.length <= previous)
       return;
-    recordChars(readString(part.messageID), partID, partText.length - previous, now);
+    recordChars(messageID, partID, text.length - previous, now);
     return;
   }
-  if (type === "message.updated") {
-    if (!isWatchedSession(properties.sessionID))
+  if (type === "session.step.ended" || type === "session.step.failed") {
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const info = properties.info;
-    if (!info || info.role !== "assistant")
+    const tokens = readRecord(payload.tokens);
+    if (!tokens)
       return;
-    if (info.time?.completed === undefined)
+    recordTokens(readString(payload.assistantMessageID), readNumber(tokens.output), readNumber(tokens.reasoning));
+    return;
+  }
+  if (type === "session.usage.updated") {
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const output = typeof info.tokens?.output === "number" ? info.tokens.output : 0;
-    const reasoning = typeof info.tokens?.reasoning === "number" ? info.tokens.reasoning : 0;
-    const messageID = readString(info.id);
-    calibrate(messageID, output, reasoning);
-    if (turnStartedAt !== null && messageID && !turnTokenMessages.has(messageID)) {
-      turnTokenMessages.add(messageID);
-      turnTokens += output + reasoning;
-    }
+    const tokens = readRecord(payload.tokens);
+    if (!tokens)
+      return;
+    const cache = readRecord(tokens.cache);
+    const output = readNumber(tokens.output);
+    const reasoning = readNumber(tokens.reasoning);
+    sessionUsage = {
+      cost: readNumber(payload.cost),
+      input: readNumber(tokens.input),
+      output,
+      reasoning,
+      cacheRead: readNumber(cache?.read),
+      cacheWrite: readNumber(cache?.write),
+      generated: output + reasoning
+    };
+    lastEventAt = now;
+    return;
+  }
+  if (type === "session.execution.started") {
+    if (!isWatchedSession(payload.sessionID))
+      return;
+    if (turnStartedAt === null)
+      turnBusyAt = now;
+    busy = true;
+    lastEventAt = now;
+    return;
+  }
+  if (type === "session.execution.succeeded" || type === "session.execution.failed") {
+    if (!isWatchedSession(payload.sessionID))
+      return;
+    busy = false;
+    lastEventAt = now;
+    finalizeTurn(now);
+    return;
+  }
+  if (type === "session.execution.interrupted") {
+    if (!isWatchedSession(payload.sessionID))
+      return;
+    lastEventAt = now;
+    if (readString(payload.reason) === "shutdown")
+      return;
+    busy = false;
+    finalizeTurn(now);
     return;
   }
   if (type === "permission.asked" || type === "permission.v2.asked") {
-    if (!isWatchedSession(properties.sessionID))
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const requestId = readString(properties.id);
+    const requestId = readString(payload.id);
     if (requestId)
       pendingPermissions.add(requestId);
     lastEventAt = now;
     return;
   }
   if (type === "permission.replied" || type === "permission.v2.replied") {
-    if (!isWatchedSession(properties.sessionID))
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const requestId = readString(properties.requestID);
+    const requestId = readString(payload.requestID);
     if (requestId)
       pendingPermissions.delete(requestId);
     lastEventAt = now;
     return;
   }
-  if (type === "question.asked" || type === "question.v2.asked") {
-    if (!isWatchedSession(properties.sessionID))
+  if (type === "form.created") {
+    const form = readRecord(payload.form);
+    if (!form || !isWatchedSession(form.sessionID))
       return;
-    const requestId = readString(properties.id);
+    const requestId = readString(form.id);
+    if (requestId)
+      pendingQuestions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+  if (type === "form.replied" || type === "form.cancelled") {
+    if (!isWatchedSession(payload.sessionID))
+      return;
+    const requestId = readString(payload.id);
+    if (requestId)
+      pendingQuestions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
+  if (type === "question.asked" || type === "question.v2.asked") {
+    if (!isWatchedSession(payload.sessionID))
+      return;
+    const requestId = readString(payload.id);
     if (requestId)
       pendingQuestions.add(requestId);
     lastEventAt = now;
     return;
   }
   if (type === "question.replied" || type === "question.rejected" || type === "question.v2.replied" || type === "question.v2.rejected") {
-    if (!isWatchedSession(properties.sessionID))
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const requestId = readString(properties.requestID);
+    const requestId = readString(payload.requestID);
     if (requestId)
       pendingQuestions.delete(requestId);
     lastEventAt = now;
     return;
   }
   if (type === "session.status") {
-    if (!isWatchedSession(properties.sessionID))
+    if (!isWatchedSession(payload.sessionID))
       return;
-    const status = properties.status;
+    const status = readRecord(payload.status);
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
@@ -233,7 +314,7 @@ var handleEvent = (event, now) => {
     return;
   }
   if (type === "session.idle") {
-    if (!isWatchedSession(properties.sessionID))
+    if (!isWatchedSession(payload.sessionID))
       return;
     busy = false;
     lastEventAt = now;
@@ -442,6 +523,7 @@ var server = http.createServer((req, res) => {
       charsPerSecond: rate.charsPerSecond,
       tokensPerSecond: rate.tokensPerSecond,
       charsPerToken,
+      sessionUsage,
       lastTurn,
       eventsSeen,
       lastEventType,

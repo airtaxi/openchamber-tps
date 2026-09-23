@@ -2,9 +2,18 @@
 
 An OpenChamber extension that shows the generation rate of the open session:
 a rolling **last-5-seconds** tokens-per-second readout, plus characters per
-second and the current chars-per-token estimate.
+second, the current chars-per-token estimate, and the session's real token
+total.
 
 The panel is a thin view. A small local service does the measuring.
+
+## Requirements
+
+- OpenChamber **2.0.0** or newer (OpenCode 2.0.15+). The extension reads the
+  OpenCode 2 event stream; the 1.0.x releases were the last ones for
+  OpenChamber 1.x, where that stream had different event names.
+- Extensions load on OpenChamber web and desktop only. VS Code and the mobile
+  app do not load them.
 
 ## What it does
 
@@ -14,6 +23,8 @@ The panel is a thin view. A small local service does the measuring.
   session title with its live status (`generating` / `idle`).
 - After a turn finishes, shows **that turn's final average** separately, so the
   live number and the completed result do not overwrite each other.
+- Shows the session's **real token total** (generated tokens, from OpenCode's
+  own usage events) beside the local estimate.
 
 ## How it measures
 
@@ -32,29 +43,40 @@ The service subscribes to `GET /api/global/event`, the same global event stream
 OpenChamber's own hub reads, and counts streamed output characters for the
 watched session inside a five-second window. Two details of that stream matter:
 
-- It wraps each event as `{ payload, directory, eventId }`, so the service
-  unwraps `payload`. A bare event is accepted too.
+- It forwards OpenCode 2 wire events (`{ id, created, type, data }`). A proxy
+  that wraps them as `{ payload, directory, eventId }` is unwrapped too.
 - `/api/event` is the directory-scoped sibling: without a `directory` parameter
   it carries only the server's default directory, so an open project never sees
   its own session events there. That is why the global stream is used.
 
 The counter itself:
 
-- `message.part.delta` with `field: "text"` is the primary source.
-- `message.part.updated` snapshots are the fallback for a server that does not
-  emit deltas. A part is counted by exactly one of the two paths.
-- Completed `message.updated` turns recalibrate chars-per-token from the real
-  `tokens.output + tokens.reasoning`, smoothed with an exponential moving
-  average and clamped to `0.05 .. 1`.
+- `session.text.delta` and `session.reasoning.delta` are the primary source.
+  `session.tool.input.delta` carries tool input, not generation, and is
+  ignored.
+- `session.text.ended` and `session.reasoning.ended` full-value boundaries are
+  the fallback for a service that attached after the deltas went by. A part is
+  counted by exactly one of the two paths.
+- Each settled step (`session.step.ended`, or `session.step.failed` with
+  counts) reports the provider's real `tokens.output + tokens.reasoning`. Those
+  recalibrate chars-per-token, smoothed with an exponential moving average and
+  clamped to `0.05 .. 1`.
+- `session.usage.updated` reports the session's running totals (cost and
+  input/output/reasoning/cache tokens). The panel shows generated tokens
+  (`output + reasoning`) from it.
 
-Tokens-per-second is `charsPerSecond × charsPerToken`. It is an estimate of
-generation throughput, not a server-reported token counter, because the event
-stream carries characters per delta and tokens only per completed turn.
+The rolling tokens-per-second is `charsPerSecond × charsPerToken`. It is an
+estimate of generation throughput, because the live stream only carries text
+fragments; real token counts arrive per settled step, not per character. The
+finished-turn average and the session total use the real counts.
 
 ## Turn average
 
-A turn spans the first streamed character after idle until `session.idle`. Its
-average divides tokens by generation time only:
+A turn spans `session.execution.started` until `session.execution.succeeded` or
+`session.execution.failed`. A `session.execution.interrupted` with reason
+`shutdown` keeps the turn open, because OpenCode resumes the same turn after a
+restart; every other interruption ends it. Its average divides tokens by
+generation time only:
 
 - Time between consecutive streamed characters counts as generation, up to a
   1-second threshold. A longer gap is a pause and is excluded, which covers tool
@@ -62,15 +84,16 @@ average divides tokens by generation time only:
 - A pending permission or question excludes the wait outright, even when the
   user answers within that threshold. OpenCode keeps the session `busy` while an
   agent waits for the user, so `waiting-permission` and `waiting-question` are
-  detected from `permission.*` and `question.*` events, and the panel shows
-  `waiting for permission` / `waiting for answer` instead of `generating`.
+  detected from `permission.*` and `form.*` events (`form.*` is the OpenCode 2
+  shape of the question tool), and the panel shows `waiting for permission` /
+  `waiting for answer` instead of `generating`.
 - Time to the first token is excluded when the first character arrives more than
   a second after the turn started.
 
 When the turn ends the service reports:
 
-- `tokens`: the sum of `output + reasoning` across the turn's completed
-  assistant messages, counted once per message.
+- `tokens`: the sum of `output + reasoning` across the turn's settled steps,
+  adjusted per assistant message id so a retried step counts once.
 - `activeMs`: accumulated generation time.
 - `wallMs`: first counted character to last counted character.
 - `pausedMs`: `wallMs - activeMs`, what the average left out.
@@ -79,7 +102,8 @@ When the turn ends the service reports:
   characters times the calibrated ratio. The panel labels the estimated case.
 
 The panel shows the active time, and adds `paused` once a turn has excluded at
-least a second. Switching the watched session clears the stored turn.
+least a second. Switching the watched session clears the stored turn and the
+session totals.
 
 ## Build
 
@@ -101,7 +125,9 @@ needs.
 
 A Git install can update itself. Bump `version` in `package.json`, rebuild, and
 push; OpenChamber offers the update the next time Settings → Extensions is
-opened. Add `#v1.0.0` or `#main` to the URL to pin a tag or branch.
+opened. Add `#v1.0.0` or `#main` to the URL to pin a tag or branch. On
+OpenChamber 1.x the install is refused: pin `#v1.0.1`, the last release for that
+line.
 
 To work on the extension itself, add the absolute path of your checkout
 instead. A folder install runs straight from that folder and never updates on
@@ -113,11 +139,13 @@ its own.
 node scripts/smoke.mjs
 ```
 
-The smoke test starts a mock event stream and the built service, feeds synthetic
-deltas and part snapshots, and asserts the counted characters, the rate, the
-calibration, the finished-turn average, and the session filtering. It covers the
-delta path, the `message.part.updated` fallback path, token rejection,
-`session.idle`, and the state cleared when the watched session changes.
+The smoke test starts a mock OpenChamber event stream and the built service,
+feeds synthetic OpenCode 2 events, and asserts the counted characters, the
+rolling rate, the calibration, the real token counts (per step and per
+session), the finished-turn average, the wait accounting, and the session
+filtering. It covers the delta path, the full-value `*ended` fallback path,
+`session.execution.*` status, the `shutdown` interruption, and the state cleared
+when the watched session changes.
 
 ## Limitations
 
@@ -130,8 +158,9 @@ delta path, the `message.part.updated` fallback path, token rejection,
   a generated password the service process never receives, which is why the
   service reads OpenChamber's own `/api/global/event` proxy rather than OpenCode
   directly. This is also why an instance-level UI password blocks it.
-- **Runtime.** Extensions load on OpenChamber web and desktop only. VS Code and
-  the mobile app do not load them.
+- **No per-token streaming.** Deltas carry characters only. The rolling number
+  stays a calibrated character estimate; real counts arrive per settled step
+  (`session.step.ended`) and per session (`session.usage.updated`).
 - **Reasoning counts as output.** Reasoning text is generated text, so deltas
   from reasoning parts are counted. That matches `tokens.output + reasoning`
   used for calibration, but it is not the same as visible answer characters.

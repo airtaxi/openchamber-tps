@@ -14,6 +14,18 @@ type TurnResult = {
   endedAt: number;
 };
 
+/** Running session totals from `session.usage.updated`; the only real counters OpenCode 2 publishes live. */
+type SessionUsage = {
+  cost: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** `output + reasoning`: tokens the model actually generated. */
+  generated: number;
+};
+
 type RateResponse = {
   connection: ConnectionState;
   error: string | null;
@@ -26,6 +38,7 @@ type RateResponse = {
   charsPerSecond: number;
   tokensPerSecond: number;
   charsPerToken: number;
+  sessionUsage: SessionUsage | null;
   lastTurn: TurnResult | null;
   eventsSeen: number;
   lastEventType: string | null;
@@ -46,6 +59,7 @@ const COPY = {
     noSession: 'No session is open. Open a chat to measure its generation rate.',
     charsPerSecond: 'Characters/s',
     charsPerToken: 'Chars per token',
+    sessionTokens: 'Session tokens',
     idle: 'idle',
     generating: 'generating',
     connecting: 'connecting',
@@ -75,6 +89,7 @@ const COPY = {
     noSession: '열린 세션이 없습니다. 챗을 열면 생성 속도를 측정합니다.',
     charsPerSecond: '초당 문자 수',
     charsPerToken: '문자당 토큰',
+    sessionTokens: '세션 토큰',
     idle: '대기',
     generating: '생성 중',
     connecting: '연결 중',
@@ -146,6 +161,7 @@ const sessionEl = el('div', 'tps-session');
 const noteEl = el('div', 'tps-note');
 const charsEl = el('dd', 'tps-detail-value');
 const ratioEl = el('dd', 'tps-detail-value');
+const sessionTokensEl = el('dd', 'tps-detail-value');
 const connectionEl = el('dd', 'tps-detail-value');
 const lastEventEl = el('dd', 'tps-detail-value');
 const eventsEl = el('dd', 'tps-detail-value');
@@ -230,6 +246,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
 
   charsEl.textContent = rate ? `${rate.charsPerSecond.toFixed(1)}` : '—';
   ratioEl.textContent = rate ? rate.charsPerToken.toFixed(3) : '—';
+  sessionTokensEl.textContent = rate?.sessionUsage ? formatCount(rate.sessionUsage.generated) : '—';
   connectionEl.textContent = rate ? rate.connection : '—';
   lastEventEl.textContent = rate ? formatAge(rate.lastEventAt) : '—';
   eventsEl.textContent = rate ? formatCount(rate.eventsSeen) : '—';
@@ -314,6 +331,7 @@ const mount = (): void => {
   };
   row(copy.charsPerSecond, charsEl);
   row(copy.charsPerToken, ratioEl);
+  row(copy.sessionTokens, sessionTokensEl);
   row(copy.statusId, connectionEl);
   row(copy.lastEvent, lastEventEl);
   row(copy.events, eventsEl);

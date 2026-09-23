@@ -2,8 +2,15 @@
 //
 // Runs as the extension's local process (manifest `contributes.service`) on
 // 127.0.0.1, reachable only through the host proxy. It subscribes to the
-// OpenChamber event stream (`GET /api/event`, the same SSE the UI reads) and
-// derives a rolling generation rate for one session.
+// OpenChamber event stream (`GET /api/global/event`, the same SSE the UI reads)
+// and derives a rolling generation rate for one session.
+//
+// The stream carries the OpenCode 2 wire events: `session.text.delta` and
+// `session.reasoning.delta` fragments, per-step token settlements
+// (`session.step.ended`), session-cumulative usage (`session.usage.updated`),
+// and execution status (`session.execution.*`). The 1.x vocabulary
+// (`message.part.delta`, `message.updated`, `session.status`) is not on this
+// stream anymore.
 //
 // The panel hands it the OpenChamber origin and the session to watch, then
 // polls `GET /rate`. The service never reaches the browser and the panel never
@@ -25,13 +32,13 @@ const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 15_000;
 
 // Character-to-token ratios vary by model, language, and content. The default
-// approximates English text; completed turns recalibrate it from real token
-// counts. The clamp keeps a single odd turn from skewing the meter.
+// approximates English text; completed steps recalibrate it from real token
+// counts. The clamp keeps a single odd step from skewing the meter.
 const DEFAULT_CHARS_PER_TOKEN = 0.25;
 const MIN_CHARS_PER_TOKEN = 0.05;
 const MAX_CHARS_PER_TOKEN = 1;
 const CALIBRATION_WEIGHT = 0.3;
-/** Ignore tiny completed turns when calibrating; they carry no signal. */
+/** Ignore tiny settled steps when calibrating; they carry no signal. */
 const MIN_CALIBRATION_CHARS = 40;
 /**
  * A gap between streamed characters longer than this is a pause, not
@@ -54,7 +61,7 @@ type WatchConfig = {
 type TurnResult = {
   /** Average tokens per second over the turn's generation time. */
   tokensPerSecond: number;
-  /** `tokens` when completed message counts existed, otherwise a character estimate. */
+  /** `tokens` when a settled step reported real counts, otherwise a character estimate. */
   source: 'tokens' | 'estimate';
   tokens: number;
   chars: number;
@@ -67,15 +74,29 @@ type TurnResult = {
   endedAt: number;
 };
 
+/** Running session totals from `session.usage.updated`, the only real counters OpenCode 2 publishes live. */
+type SessionUsage = {
+  cost: number;
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+  /** `output + reasoning`: tokens the model actually generated. */
+  generated: number;
+};
+
 type WaitingKind = 'permission' | 'question';
 
 const samples: Sample[] = [];
-/** Characters seen per part id, used to diff `message.part.updated` snapshots. */
+/** Characters seen per part id, used to diff `session.text.ended` / `session.reasoning.ended` snapshots. */
 const partChars = new Map<string, number>();
-/** Parts already counted through `message.part.delta`, never diffed again. */
+/** Parts already counted through streaming deltas, never diffed again. */
 const deltaParts = new Set<string>();
-/** Characters seen per message id, used to calibrate tokens per character. */
+/** Characters seen per assistant message id, used to calibrate tokens per character. */
 const messageChars = new Map<string, number>();
+/** Last token total reported per settled step (`assistantMessageID`), so retries settle once. */
+const stepTokens = new Map<string, number>();
 
 let watch: WatchConfig | null = null;
 let connection: ConnectionState = 'idle';
@@ -86,21 +107,23 @@ let eventsSeen = 0;
 let lastEventType: string | null = null;
 let busy = false;
 let charsPerToken = DEFAULT_CHARS_PER_TOKEN;
+let sessionUsage: SessionUsage | null = null;
 let controller: AbortController | null = null;
 let retryTimer: NodeJS.Timeout | null = null;
 let retryDelay = RETRY_BASE_MS;
 
-// The turn in progress. A turn spans the first streamed character after idle
-// until `session.idle`. Its average divides tokens by generation time only:
-// pauses between streamed characters, whether a tool call or a wait for the
-// user, are excluded.
+// The turn in progress. A turn spans `session.execution.started` until
+// `session.execution.succeeded` / `failed` (or `session.idle` on a 1.x-shaped
+// stream). Its average divides tokens by generation time only: pauses between
+// streamed characters, whether a tool call or a wait for the user, are
+// excluded.
 let turnStartedAt: number | null = null;
 let turnLastCharAt: number | null = null;
 let turnBusyAt: number | null = null;
 let turnChars = 0;
 let turnTokens = 0;
 let turnActiveMs = 0;
-const turnTokenMessages = new Set<string>();
+let turnSawTokens = false;
 let lastTurn: TurnResult | null = null;
 // Pending permission and question requests for the watched session. OpenCode
 // keeps the session `busy` while an agent waits for the user; these sets are
@@ -119,7 +142,7 @@ const clearTurn = (): void => {
   turnChars = 0;
   turnTokens = 0;
   turnActiveMs = 0;
-  turnTokenMessages.clear();
+  turnSawTokens = false;
 };
 
 const resetMeasurement = (): void => {
@@ -127,8 +150,10 @@ const resetMeasurement = (): void => {
   partChars.clear();
   deltaParts.clear();
   messageChars.clear();
+  stepTokens.clear();
   lastEventAt = 0;
   busy = false;
+  sessionUsage = null;
   clearTurn();
   pendingPermissions.clear();
   pendingQuestions.clear();
@@ -144,7 +169,7 @@ const finalizeTurn = (now: number): void => {
   // A single streamed chunk gives no gap to measure; bound the fallback by the
   // widest gap still treated as generation.
   const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
-  const source: TurnResult['source'] = turnTokenMessages.size > 0 ? 'tokens' : 'estimate';
+  const source: TurnResult['source'] = turnSawTokens ? 'tokens' : 'estimate';
   const tokens = source === 'tokens' ? turnTokens : turnChars * charsPerToken;
   lastTurn = {
     tokensPerSecond: tokens / (activeMs / 1000),
@@ -199,6 +224,23 @@ const isWatchedSession = (sessionID: unknown): boolean => (
 
 const readString = (value: unknown): string => (typeof value === 'string' ? value : '');
 
+const readNumber = (value: unknown): number => (
+  typeof value === 'number' && Number.isFinite(value) ? value : 0
+);
+
+const readRecord = (value: unknown): Record<string, unknown> | null => (
+  value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+);
+
+/** Stable part identity for OpenCode 2 text and reasoning fragments. */
+const fragmentPartID = (messageID: string, kind: 'text' | 'reasoning', ordinal: unknown): string => {
+  if (!messageID) return '';
+  const index = typeof ordinal === 'number' && Number.isInteger(ordinal) && ordinal >= 0 ? ordinal : 0;
+  return `${messageID}:${kind}:${index}`;
+};
+
 const calibrate = (messageID: string, output: number, reasoning: number): void => {
   const chars = messageChars.get(messageID) ?? 0;
   if (chars < MIN_CALIBRATION_CHARS) return;
@@ -208,103 +250,190 @@ const calibrate = (messageID: string, output: number, reasoning: number): void =
   charsPerToken = charsPerToken + (ratio - charsPerToken) * CALIBRATION_WEIGHT;
 };
 
-type RawEvent = { type?: unknown; properties?: unknown };
+/**
+ * Folds a settled step's real token counts into the calibration ratio and,
+ * while a turn is running, into the turn's token total. The total adjusts by
+ * the difference for the message id, so a retry of the same step reports its
+ * final counts exactly once.
+ */
+const recordTokens = (messageID: string, output: number, reasoning: number): void => {
+  const generated = output + reasoning;
+  if (!messageID || generated <= 0) return;
+  calibrate(messageID, output, reasoning);
+  const previous = stepTokens.get(messageID) ?? 0;
+  stepTokens.set(messageID, generated);
+  if (turnStartedAt === null) return;
+  turnTokens += generated - previous;
+  if (generated > previous) turnSawTokens = true;
+};
+
+type RawEvent = { type?: unknown; data?: unknown; properties?: unknown };
 
 const handleEvent = (event: RawEvent, now: number): void => {
   const type = readString(event.type);
   if (!type) return;
-  const properties = (event.properties && typeof event.properties === 'object' ? event.properties : {}) as Record<string, unknown>;
+  // OpenCode 2 carries fields in `data`; the 1.x shapes used `properties`.
+  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  if (!payload) return;
 
-  if (type === 'message.part.delta') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    if (readString(properties.field) !== 'text') return;
-    const partID = readString(properties.partID);
-    const messageID = readString(properties.messageID);
-    const delta = readString(properties.delta);
-    if (!partID || !messageID || delta.length === 0) return;
+  // --- streamed output (OpenCode 2) ---------------------------------------
+
+  if (type === 'session.text.delta' || type === 'session.reasoning.delta') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    const messageID = readString(payload.assistantMessageID);
+    const delta = readString(payload.delta);
+    const kind = type === 'session.reasoning.delta' ? 'reasoning' : 'text';
+    const partID = fragmentPartID(messageID, kind, payload.ordinal);
+    if (!partID || delta.length === 0) return;
     deltaParts.add(partID);
     recordChars(messageID, partID, delta.length, now);
     return;
   }
 
-  if (type === 'message.part.updated') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const part = properties.part as { id?: unknown; messageID?: unknown; type?: unknown; text?: unknown } | undefined;
-    if (!part) return;
-    if (part.type !== 'text' && part.type !== 'reasoning') return;
-    const partID = readString(part.id);
-    const partText = readString(part.text);
+  // The replayable full-value boundary of a fragment. It stands in for a
+  // service that attached after the deltas went by; a part counted through
+  // deltas is never diffed again.
+  if (type === 'session.text.ended' || type === 'session.reasoning.ended') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    const messageID = readString(payload.assistantMessageID);
+    const kind = type === 'session.reasoning.ended' ? 'reasoning' : 'text';
+    const partID = fragmentPartID(messageID, kind, payload.ordinal);
     if (!partID) return;
-    // Deltas are the finer source; never count the same part twice.
     if (deltaParts.has(partID)) return;
+    const text = readString(payload.text);
     const previous = partChars.get(partID) ?? 0;
-    if (partText.length <= previous) return;
-    recordChars(readString(part.messageID), partID, partText.length - previous, now);
+    if (text.length <= previous) return;
+    recordChars(messageID, partID, text.length - previous, now);
     return;
   }
 
-  if (type === 'message.updated') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const info = properties.info as {
-      id?: unknown;
-      role?: unknown;
-      tokens?: { output?: unknown; reasoning?: unknown };
-      time?: { completed?: unknown };
-    } | undefined;
-    if (!info || info.role !== 'assistant') return;
-    // Calibrate only on finished turns; a streaming message reports partial tokens.
-    if (info.time?.completed === undefined) return;
-    const output = typeof info.tokens?.output === 'number' ? info.tokens.output : 0;
-    const reasoning = typeof info.tokens?.reasoning === 'number' ? info.tokens.reasoning : 0;
-    const messageID = readString(info.id);
-    calibrate(messageID, output, reasoning);
-    // Real token counts for the turn in progress. One completed message is
-    // counted once even when the server repeats its final snapshot.
-    if (turnStartedAt !== null && messageID && !turnTokenMessages.has(messageID)) {
-      turnTokenMessages.add(messageID);
-      turnTokens += output + reasoning;
-    }
+  // `session.tool.input.delta` and the other tool events are not generation.
+
+  // --- real token counts (OpenCode 2) -------------------------------------
+
+  if (type === 'session.step.ended' || type === 'session.step.failed') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    const tokens = readRecord(payload.tokens);
+    if (!tokens) return;
+    recordTokens(
+      readString(payload.assistantMessageID),
+      readNumber(tokens.output),
+      readNumber(tokens.reasoning),
+    );
     return;
   }
+
+  if (type === 'session.usage.updated') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    const tokens = readRecord(payload.tokens);
+    if (!tokens) return;
+    const cache = readRecord(tokens.cache);
+    const output = readNumber(tokens.output);
+    const reasoning = readNumber(tokens.reasoning);
+    sessionUsage = {
+      cost: readNumber(payload.cost),
+      input: readNumber(tokens.input),
+      output,
+      reasoning,
+      cacheRead: readNumber(cache?.read),
+      cacheWrite: readNumber(cache?.write),
+      generated: output + reasoning,
+    };
+    lastEventAt = now;
+    return;
+  }
+
+  // --- live status (OpenCode 2) -------------------------------------------
+
+  if (type === 'session.execution.started') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    // Mark where the turn began so time to first token can be judged.
+    if (turnStartedAt === null) turnBusyAt = now;
+    busy = true;
+    lastEventAt = now;
+    return;
+  }
+
+  if (type === 'session.execution.succeeded' || type === 'session.execution.failed') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    busy = false;
+    lastEventAt = now;
+    finalizeTurn(now);
+    return;
+  }
+
+  if (type === 'session.execution.interrupted') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    lastEventAt = now;
+    // A shutdown is not the end of the turn: OpenCode keeps the execution
+    // claim and resumes the same turn after restart, so the session stays busy
+    // until the real terminal outcome arrives.
+    if (readString(payload.reason) === 'shutdown') return;
+    busy = false;
+    finalizeTurn(now);
+    return;
+  }
+
+  // --- requests to the user -----------------------------------------------
 
   if (type === 'permission.asked' || type === 'permission.v2.asked') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const requestId = readString(properties.id);
+    if (!isWatchedSession(payload.sessionID)) return;
+    const requestId = readString(payload.id);
     if (requestId) pendingPermissions.add(requestId);
     lastEventAt = now;
     return;
   }
 
   if (type === 'permission.replied' || type === 'permission.v2.replied') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const requestId = readString(properties.requestID);
+    if (!isWatchedSession(payload.sessionID)) return;
+    const requestId = readString(payload.requestID);
     if (requestId) pendingPermissions.delete(requestId);
     lastEventAt = now;
     return;
   }
 
+  // OpenCode 2 models the question tool as a form.
+  if (type === 'form.created') {
+    const form = readRecord(payload.form);
+    if (!form || !isWatchedSession(form.sessionID)) return;
+    const requestId = readString(form.id);
+    if (requestId) pendingQuestions.add(requestId);
+    lastEventAt = now;
+    return;
+  }
+
+  if (type === 'form.replied' || type === 'form.cancelled') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    const requestId = readString(payload.id);
+    if (requestId) pendingQuestions.delete(requestId);
+    lastEventAt = now;
+    return;
+  }
+
   if (type === 'question.asked' || type === 'question.v2.asked') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const requestId = readString(properties.id);
+    if (!isWatchedSession(payload.sessionID)) return;
+    const requestId = readString(payload.id);
     if (requestId) pendingQuestions.add(requestId);
     lastEventAt = now;
     return;
   }
 
   if (type === 'question.replied' || type === 'question.rejected' || type === 'question.v2.replied' || type === 'question.v2.rejected') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const requestId = readString(properties.requestID);
+    if (!isWatchedSession(payload.sessionID)) return;
+    const requestId = readString(payload.requestID);
     if (requestId) pendingQuestions.delete(requestId);
     lastEventAt = now;
     return;
   }
 
+  // OpenCode 2 declares `session.status` and `session.idle` but its own status
+  // comes from the execution events above; a server that still emits them is
+  // handled here for completeness.
   if (type === 'session.status') {
-    if (!isWatchedSession(properties.sessionID)) return;
-    const status = properties.status as { type?: unknown } | undefined;
+    if (!isWatchedSession(payload.sessionID)) return;
+    const status = readRecord(payload.status);
     const nextBusy = status?.type === 'busy' || status?.type === 'retry';
     if (busy && !nextBusy) finalizeTurn(now);
-    // Mark where the turn began so time to first token can be judged.
     if (nextBusy && turnStartedAt === null) turnBusyAt = now;
     busy = nextBusy;
     lastEventAt = now;
@@ -312,7 +441,7 @@ const handleEvent = (event: RawEvent, now: number): void => {
   }
 
   if (type === 'session.idle') {
-    if (!isWatchedSession(properties.sessionID)) return;
+    if (!isWatchedSession(payload.sessionID)) return;
     busy = false;
     lastEventAt = now;
     finalizeTurn(now);
@@ -333,8 +462,8 @@ const handleSseChunk = (chunk: string): void => {
     return;
   }
   if (!parsed || typeof parsed !== 'object') return;
-  // The global stream wraps each event as `{ payload, directory, eventId }`;
-  // the directory stream sends the event itself. Accept both.
+  // OpenCode 2 frames are the event itself; a proxy that wraps them as
+  // `{ payload, directory, eventId }` is unwrapped here.
   const envelope = parsed as { payload?: unknown };
   const event = (envelope.payload && typeof envelope.payload === 'object' ? envelope.payload : parsed) as RawEvent;
   eventsSeen += 1;
@@ -529,6 +658,7 @@ const server = http.createServer((req, res) => {
       charsPerSecond: rate.charsPerSecond,
       tokensPerSecond: rate.tokensPerSecond,
       charsPerToken,
+      sessionUsage,
       lastTurn,
       eventsSeen,
       lastEventType,

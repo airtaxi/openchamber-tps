@@ -5,7 +5,7 @@
     "": {
       "name": "openchamber-tps",
       "dependencies": {
-        "@openchamber/sdk": "^1.24.0",
+        "@openchamber/sdk": "^2.0.0",
       },
       "devDependencies": {
         "@types/node": "^22.20.3",
@@ -13,7 +13,7 @@
     },
   },
   "packages": {
-    "@openchamber/sdk": ["@openchamber/sdk@1.24.0", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-UgC+UlyQKmeFd7YExHk1sbnGEdBDObi6jUJ09oG6m3D9rHfKRbjQ/ao+3Sa/TBErOD9OmrHjvVv1rQ0BF7+bdw=="],
+    "@openchamber/sdk": ["@openchamber/sdk@2.0.0", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-K/tYwbxDZ5qGeQ46X4LYrfUUq3VfO0cEGLNLp+bZrcO92ZBp9+lJijFAptr26iM1ImLrtdkj5FHDCzlnQrMX0w=="],
 
     "@types/node": ["@types/node@22.20.3", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-DZmzkmwHzXrLPAXPyKNDzlIwMMUZCVacoD25ywdy5YTKGbOx/2ld+Q38Im2zJ0vBuZP5Prd3VZutKZyXwkOS8A=="],
 
