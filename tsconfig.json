@@ -13,5 +13,5 @@
     "skipLibCheck": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["panel/main.ts", "service/main.ts"]
+  "include": ["status/main.ts", "panel/main.ts", "service/main.ts"]
 }
