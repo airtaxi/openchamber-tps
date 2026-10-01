@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "OpenChamber extension panel that shows a rolling 5-second generation rate (TPS) for the open session.",
+  "description": "OpenChamber extension that shows a rolling 5-second generation rate (TPS) for the open session, as a Work Status section and as a full rail panel.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/airtaxi/openchamber-tps.git"
@@ -21,6 +21,11 @@
         "icon": "speed-up-line",
         "entry": "panel/index.html"
       },
+      "statusSection": {
+        "entry": "status/index.html",
+        "title": "TPS",
+        "height": 64
+      },
       "service": {
         "entry": "service/main.js",
         "runtime": "host"
@@ -28,12 +33,13 @@
     }
   },
   "scripts": {
-    "build": "bun run build:panel && bun run build:service",
+    "build": "bun run build:status && bun run build:panel && bun run build:service",
+    "build:status": "bunx openchamber-guest-bundle status/main.ts status/main.js",
     "build:panel": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
     "build:service": "bunx openchamber-guest-bundle --node service/main.ts service/main.js"
   },
   "dependencies": {
-    "@openchamber/sdk": "^2.0.0"
+    "@openchamber/sdk": "^2.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.3"

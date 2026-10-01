@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TPS</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+      }
+
+      body {
+        padding: 6px 10px;
+        box-sizing: border-box;
+        background: var(--oc-bg);
+        color: var(--oc-fg);
+        font-family: var(--oc-font);
+        overflow: hidden;
+      }
+
+      #root {
+        height: 100%;
+      }
+
+      .tps-status {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        height: 100%;
+        box-sizing: border-box;
+      }
+
+      .tps-readout {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .tps-value {
+        font-size: 1.375rem;
+        line-height: 1.1;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .tps-unit {
+        color: var(--oc-muted);
+        font-size: 0.8125rem;
+      }
+
+      .tps-badge-slot {
+        margin-left: auto;
+        flex-shrink: 0;
+      }
+
+      .tps-bar {
+        height: 4px;
+        border-radius: 999px;
+        background: var(--oc-selection);
+        overflow: hidden;
+      }
+
+      .tps-bar-fill {
+        width: 100%;
+        height: 100%;
+        background: var(--oc-primary);
+        transform-origin: left center;
+        transform: scaleX(0);
+        transition: transform 160ms linear;
+      }
+
+      .tps-notice {
+        color: var(--oc-muted);
+        font-size: 0.75rem;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .tps-notice:empty {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="main.js"></script>
+  </body>
+</html>

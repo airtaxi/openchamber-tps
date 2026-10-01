@@ -17,19 +17,23 @@ The panel is a thin view. A small local service does the measuring.
 
 ## What it does
 
-- Opens as a rail panel next to the built-in panels.
+- Opens in **two** places, off one build:
+  - a **Work Status section** next to the chat (`contributes.statusSection` with
+    its own `status/index.html`), toggled and reordered in the Work Status
+    panel's section list like the built-in sections;
+  - the full **rail panel** (`contributes.panel`, `panel/index.html`), with the
+    large `tok/s` readout, the bar, the session line, the last-turn average, the
+    details table and the Retry button.
 - Follows the open chat. Switch sessions and it rewires to the new one.
-- Shows a large `tok/s` value, a bar that tracks the recent peak, and the
-  session title with its live status (`generating` / `idle`).
-- After a turn finishes, shows **that turn's final average** separately, so the
-  live number and the completed result do not overwrite each other.
-- Shows the session's **real token total** (generated tokens, from OpenCode's
-  own usage events) beside the local estimate.
+- The section shows only the `tok/s` value, a bar that tracks the recent peak,
+  and the live status (`generating` / `idle` / `waiting for permission` /
+  `waiting for answer`). The rail panel carries the full detail.
+- Both surfaces poll the same service; they are independent views, not mirrors.
 
 ## How it measures
 
 ```
-panel (sandboxed iframe)
+status section + rail panel (sandboxed iframes)
   │  POST /watch { origin, sessionId }   ← the origin comes from location.href
   │  GET  /rate                          ← polled every 250 ms
   ▼
@@ -101,18 +105,19 @@ When the turn ends the service reports:
 - `source`: `tokens` when real counts existed, otherwise `estimate` from
   characters times the calibrated ratio. The panel labels the estimated case.
 
-The panel shows the active time, and adds `paused` once a turn has excluded at
-least a second. Switching the watched session clears the stored turn and the
-session totals.
+The section does not draw the turn average; the rail panel does. The average is
+measured either way and returned over `/rate`. Switching the watched session
+clears the stored turn and the session totals.
 
 ## Build
 
 ```bash
 bun install
-bun run build      # panel/main.js (IIFE) + service/main.js (ESM)
+bun run build      # status/main.js + panel/main.js (IIFE) + service/main.js (ESM)
 ```
 
-`bun run build:panel` and `bun run build:service` build one side each. Both use
+`bun run build:status`, `bun run build:panel` and `bun run build:service` build
+one side each. Both surfaces use
 `openchamber-guest-bundle` from `@openchamber/sdk`. Commit the built files:
 OpenChamber never compiles an extension at install time.
 
@@ -151,9 +156,13 @@ when the watched session changes.
 
 - **OpenChamber UI password.** The service subscribes to `/api/global/event`
   without a session. If the instance is protected with a UI password, the stream
-  answers `401` and the panel shows a reconnect notice instead of a rate.
-- **Relay frames.** Under the private relay the panel runs from `srcDoc` with no
+  answers `401` and both surfaces show a reconnect notice instead of a rate.
+- **Relay frames.** Under the private relay a surface runs from `srcDoc` with no
   usable origin, so the meter cannot discover the event stream and says so.
+- **Work Status visibility.** OpenChamber loads the section only while the Work
+  Status panel is visible and the section is expanded, and unloads it when you
+  collapse it. Nothing is kept in the page between mounts. The rail panel is
+  unaffected and keeps its own state while it stays open.
 - **Managed OpenCode auth.** OpenChamber starts its managed OpenCode server with
   a generated password the service process never receives, which is why the
   service reads OpenChamber's own `/api/global/event` proxy rather than OpenCode
