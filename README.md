@@ -5,13 +5,16 @@ a rolling **last-5-seconds** tokens-per-second readout, plus characters per
 second, the current chars-per-token estimate, and the session's real token
 total.
 
-The panel is a thin view. A small local service does the measuring.
+It shows up in two places: a rail panel with the full detail, and a compact
+section in the chat's Work Status panel. Both are thin views. A small local
+service does the measuring.
 
 ## Requirements
 
-- OpenChamber **2.0.0** or newer (OpenCode 2.0.15+). The extension reads the
-  OpenCode 2 event stream; the 1.0.x releases were the last ones for
-  OpenChamber 1.x, where that stream had different event names.
+- OpenChamber **2.0.1** or newer (OpenCode 2.0.15+). The extension reads the
+  OpenCode 2 event stream, and the Work Status section needs 2.0.1. The 1.0.x
+  releases were the last ones for OpenChamber 1.x, where that stream had
+  different event names.
 - Extensions load on OpenChamber web and desktop only. VS Code and the mobile
   app do not load them.
 
@@ -26,12 +29,32 @@ The panel is a thin view. A small local service does the measuring.
 - Shows the session's **real token total** (generated tokens, from OpenCode's
   own usage events) beside the local estimate.
 
+### Work Status section
+
+The chat's Work Status panel gets a **TPS** section with three lines:
+
+| Line | Shows |
+| --- | --- |
+| Live | The rolling 5-second `tok/s` and a bar against the recent peak. The number turns muted between turns. |
+| Last turn | The finished turn's tokens over its generation time, and its average `tok/s`. A `~` marks a character estimate; hover for the active and paused time. |
+| Session | Tokens generated in the session so far (`output + reasoning`). |
+
+Problems that stop the measurement (the service is not approved, the surface
+cannot reach the server) replace the lines with a short note. The section
+follows the chat it sits in, sizes itself to its content, and can be hidden or
+moved from the panel's section chooser like any other section.
+
+The section is a frame of its own rather than a section OpenChamber draws from
+a service answer (`statusSection.source`). Such an answer is requested with
+only the app's locale and the project directory, while the service needs the
+session and the OpenChamber origin, which only a frame can hand it.
+
 ## How it measures
 
 ```
-panel (sandboxed iframe)
+rail panel / Work Status section (sandboxed iframes)
   │  POST /watch { origin, sessionId }   ← the origin comes from location.href
-  │  GET  /rate                          ← polled every 250 ms
+  │  GET  /rate                          ← polled every 250 ms (panel) or 500 ms (section)
   ▼
 host loopback proxy  ──►  service process (127.0.0.1)
                               │  GET <origin>/api/global/event   (Server-Sent Events)
@@ -109,19 +132,22 @@ session totals.
 
 ```bash
 bun install
-bun run build      # panel/main.js (IIFE) + service/main.js (ESM)
+bun run build      # panel/main.js + status/main.js (IIFE), service/main.js (ESM)
 ```
 
-`bun run build:panel` and `bun run build:service` build one side each. Both use
-`openchamber-guest-bundle` from `@openchamber/sdk`. Commit the built files:
-OpenChamber never compiles an extension at install time.
+`bun run build:panel`, `bun run build:status`, and `bun run build:service`
+build one part each. All use `openchamber-guest-bundle` from
+`@openchamber/sdk`. Code both frames use (the `/rate` answer shape, the origin
+lookup, host error messages) lives in `shared/` and is bundled into each frame.
+Commit the built files: OpenChamber never compiles an extension at install
+time.
 
 ## Install
 
 Settings → Extensions → **Folder, ZIP, or URL**, paste
 `https://github.com/airtaxi/openchamber-tps`, and choose **Add**. Approve the
 permissions dialog: it includes **Run a local service**, which is what the meter
-needs.
+needs. The rail icon and the Work Status section appear once it is approved.
 
 A Git install can update itself. Bump `version` in `package.json`, rebuild, and
 push; OpenChamber offers the update the next time Settings → Extensions is
@@ -164,6 +190,9 @@ when the watched session changes.
 - **Reasoning counts as output.** Reasoning text is generated text, so deltas
   from reasoning parts are counted. That matches `tokens.output + reasoning`
   used for calibration, but it is not the same as visible answer characters.
+- **One watched session.** The service measures one session at a time. The rail
+  panel and the Work Status section follow the same chat, so they agree; two
+  windows on different chats move the service to whichever switched last.
 
 ## License
 

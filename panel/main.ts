@@ -1,49 +1,7 @@
-import { connectHost, HostRequestError } from '@openchamber/sdk';
+import { connectHost } from '@openchamber/sdk';
 import { applyHostReady, mountBadge, mountBanner, mountButton, mountSeparator } from '@openchamber/sdk/ui';
 
-type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
-
-type TurnResult = {
-  tokensPerSecond: number;
-  source: 'tokens' | 'estimate';
-  tokens: number;
-  chars: number;
-  activeMs: number;
-  wallMs: number;
-  pausedMs: number;
-  endedAt: number;
-};
-
-/** Running session totals from `session.usage.updated`; the only real counters OpenCode 2 publishes live. */
-type SessionUsage = {
-  cost: number;
-  input: number;
-  output: number;
-  reasoning: number;
-  cacheRead: number;
-  cacheWrite: number;
-  /** `output + reasoning`: tokens the model actually generated. */
-  generated: number;
-};
-
-type RateResponse = {
-  connection: ConnectionState;
-  error: string | null;
-  sessionId: string | null;
-  busy: boolean;
-  active: boolean;
-  lastEventAt: number | null;
-  windowMs: number;
-  chars: number;
-  charsPerSecond: number;
-  tokensPerSecond: number;
-  charsPerToken: number;
-  sessionUsage: SessionUsage | null;
-  lastTurn: TurnResult | null;
-  eventsSeen: number;
-  lastEventType: string | null;
-  waiting: 'permission' | 'question' | null;
-};
+import { describeHostError, el, formatCount, formatSeconds, resolveOrigin, type RateResponse } from '../shared/meter';
 
 type HostContext = {
   locale: string;
@@ -120,27 +78,6 @@ const host = connectHost();
 const root = document.querySelector('#root');
 if (!root) throw new Error('Missing #root');
 
-const resolveOrigin = (): string | null => {
-  try {
-    const url = new URL(window.location.href);
-    if (url.protocol === 'http:' || url.protocol === 'https:') return url.origin;
-  } catch {
-    // about:srcdoc, an opaque sandbox origin, or no window: nothing usable.
-  }
-  return null;
-};
-
-const el = <K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  className?: string,
-  text?: string,
-): HTMLElementTagNameMap[K] => {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-};
-
 let copy: Copy = COPY.en;
 let origin: string | null = null;
 let context: HostContext = { locale: 'en', directory: null, session: null };
@@ -168,15 +105,7 @@ const eventsEl = el('dd', 'tps-detail-value');
 const lastTurnValueEl = el('div', 'tps-lastturn-value', '—');
 const lastTurnMetaEl = el('div', 'tps-lastturn-meta');
 
-const describeError = (error: unknown): string => {
-  if (error instanceof HostRequestError) {
-    if (error.code === 'NO_SERVICE' || error.code === 'SERVICE_FAILED') return copy.serviceHint;
-    if (error.code === 'DISABLED') return copy.disabled;
-    if (error.code === 'HOST_TIMEOUT') return copy.reconnecting;
-    return `${error.code}: ${error.message}`;
-  }
-  return error instanceof Error ? error.message : String(error);
-};
+const describeError = (error: unknown): string => describeHostError(error, copy);
 
 const setNotice = (message: string | null, tone: 'info' | 'warning' | 'error' = 'warning'): void => {
   if (!message) {
@@ -207,10 +136,6 @@ const formatAge = (lastEventAt: number | null): string => {
   const seconds = Math.max(0, (Date.now() - lastEventAt) / 1000);
   return seconds < 1 ? '<1 s' : `${seconds.toFixed(0)} s`;
 };
-
-const formatCount = (value: number): string => Math.round(value).toLocaleString();
-
-const formatSeconds = (ms: number): string => `${(ms / 1000).toFixed(1)} s`;
 
 const renderLastTurn = (rate: RateResponse | null): void => {
   const turn = rate?.lastTurn ?? null;
