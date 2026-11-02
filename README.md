@@ -74,12 +74,17 @@ watched session inside a five-second window. Two details of that stream matter:
 
 The counter itself:
 
-- `session.text.delta` and `session.reasoning.delta` are the primary source.
-  `session.tool.input.delta` carries tool input, not generation, and is
-  ignored.
-- `session.text.ended` and `session.reasoning.ended` full-value boundaries are
-  the fallback for a service that attached after the deltas went by. A part is
-  counted by exactly one of the two paths.
+- Text, reasoning, and tool input all count. Tool call arguments are generated
+  by the model and billed in `tokens.output`, so leaving them out would compare
+  a step's full token count with only part of its characters.
+- `session.text.delta`, `session.reasoning.delta`, and
+  `session.tool.input.delta` are the primary source.
+- The full-value boundaries (`session.text.ended`, `session.reasoning.ended`,
+  `session.tool.input.ended`) cover a part that sent no fragments. Some
+  providers deliver reasoning in one piece at the end of the part, and tool
+  input usually arrives only there. They are also the fallback for a service
+  that attached after the deltas went by. A part is counted by exactly one of
+  the two paths.
 - Each settled step (`session.step.ended`, or `session.step.failed` with
   counts) reports the provider's real `tokens.output + tokens.reasoning`. Those
   recalibrate chars-per-token, smoothed with an exponential moving average and
@@ -90,39 +95,51 @@ The counter itself:
 
 The rolling tokens-per-second is `charsPerSecond × charsPerToken`. It is an
 estimate of generation throughput, because the live stream only carries text
-fragments; real token counts arrive per settled step, not per character. The
-finished-turn average and the session total use the real counts.
+fragments; real token counts arrive per settled step, not per character. A part
+that arrives in one piece enters the window at once, so the live number moves
+in steps for it. The finished-turn average and the session total use the real
+counts.
 
 ## Turn average
 
 A turn spans `session.execution.started` until `session.execution.succeeded` or
 `session.execution.failed`. A `session.execution.interrupted` with reason
 `shutdown` keeps the turn open, because OpenCode resumes the same turn after a
-restart; every other interruption ends it. Its average divides tokens by
-generation time only:
+restart; every other interruption ends it. Its average divides tokens by the
+time the model spent streaming them:
 
-- Time between consecutive streamed characters counts as generation, up to a
-  1-second threshold. A longer gap is a pause and is excluded, which covers tool
-  execution and retries.
-- A pending permission or question excludes the wait outright, even when the
-  user answers within that threshold. OpenCode keeps the session `busy` while an
-  agent waits for the user, so `waiting-permission` and `waiting-question` are
-  detected from `permission.*` and `form.*` events (`form.*` is the OpenCode 2
-  shape of the question tool), and the panel shows `waiting for permission` /
-  `waiting for answer` instead of `generating`.
-- Time to the first token is excluded when the first character arrives more than
-  a second after the turn started.
+- Each step (one model call) counts from its first output to
+  `session.step.streamed`, the end of its model stream. The first output is a
+  part start (`session.text.started`, `session.reasoning.started`,
+  `session.tool.input.started`) or the first fragment, whichever comes first.
+  Without `session.step.streamed`, the step ends at its last output.
+- Everything between the spans is left out: time to the first token of each
+  step, tool execution, retries, and waits for the user. Tools run after
+  `session.step.streamed`, and `session.step.ended` follows them, so the step's
+  settlement is never used as the end of its stream.
+- Gaps between characters are not used. Reasoning can arrive in one piece or in
+  bursts seconds apart, and tool input often arrives with no fragments at all,
+  while the model is generating the whole time.
+- OpenCode keeps the session `busy` while an agent waits for the user, so
+  `waiting-permission` and `waiting-question` are detected from `permission.*`
+  and `form.*` events (`form.*` is the OpenCode 2 shape of the question tool),
+  and the panel shows `waiting for permission` / `waiting for answer` instead of
+  `generating`. Those waits happen while a tool runs, outside every span.
 
 When the turn ends the service reports:
 
 - `tokens`: the sum of `output + reasoning` across the turn's settled steps,
   adjusted per assistant message id so a retried step counts once.
-- `activeMs`: accumulated generation time.
-- `wallMs`: first counted character to last counted character.
+- `activeMs`: the sum of the steps' streaming spans, one per assistant message
+  id, so a retried step counts once here too.
+- `wallMs`: the turn's first output to the end of its last step's stream.
 - `pausedMs`: `wallMs - activeMs`, what the average left out.
 - `tokensPerSecond`: `tokens / activeMs`.
 - `source`: `tokens` when real counts existed, otherwise `estimate` from
   characters times the calibrated ratio. The panel labels the estimated case.
+
+A turn whose output spans less than 100 ms reports no average: a service that
+attached late sees only finished parts and has no timing for them.
 
 The panel shows the active time, and adds `paused` once a turn has excluded at
 least a second. Switching the watched session clears the stored turn and the
@@ -166,12 +183,13 @@ node scripts/smoke.mjs
 ```
 
 The smoke test starts a mock OpenChamber event stream and the built service,
-feeds synthetic OpenCode 2 events, and asserts the counted characters, the
-rolling rate, the calibration, the real token counts (per step and per
-session), the finished-turn average, the wait accounting, and the session
-filtering. It covers the delta path, the full-value `*ended` fallback path,
-`session.execution.*` status, the `shutdown` interruption, and the state cleared
-when the watched session changes.
+feeds synthetic OpenCode 2 events in the order a real stream sends them, and
+asserts the counted characters, the rolling rate, the calibration, the real
+token counts (per step and per session), the finished-turn average, the wait
+accounting, and the session filtering. It covers reasoning that arrives in one
+piece, tool input with no fragments, the delta path, the full-value `*ended`
+fallback path, `session.execution.*` status, the `shutdown` interruption, and
+the state cleared when the watched session changes.
 
 ## Limitations
 

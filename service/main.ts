@@ -5,8 +5,10 @@
 // OpenChamber event stream (`GET /api/global/event`, the same SSE the UI reads)
 // and derives a rolling generation rate for one session.
 //
-// The stream carries the OpenCode 2 wire events: `session.text.delta` and
-// `session.reasoning.delta` fragments, per-step token settlements
+// The stream carries the OpenCode 2 wire events: text, reasoning, and tool
+// input parts (`session.text.*`, `session.reasoning.*`,
+// `session.tool.input.*`), the end of each step's model stream
+// (`session.step.streamed`), per-step token settlements
 // (`session.step.ended`), session-cumulative usage (`session.usage.updated`),
 // and execution status (`session.execution.*`). The 1.x vocabulary
 // (`message.part.delta`, `message.updated`, `session.status`) is not on this
@@ -41,12 +43,13 @@ const CALIBRATION_WEIGHT = 0.3;
 /** Ignore tiny settled steps when calibrating; they carry no signal. */
 const MIN_CALIBRATION_CHARS = 40;
 /**
- * A gap between streamed characters longer than this is a pause, not
- * generation: tool execution, a retry, or the agent waiting for the user. That
- * time is excluded from the turn's average. Streamed chunks normally arrive in
- * tens of milliseconds, so the separation is wide.
+ * A turn whose model output spans less than this has no usable timing, such as
+ * a service that attached after the stream went by and saw only finished
+ * parts. Its average is not reported.
  */
-const MAX_STREAM_GAP_MS = 1_000;
+const MIN_MEASURABLE_MS = 100;
+/** How long after the last output the session still counts as generating. */
+const ACTIVE_HOLD_MS = 2_000;
 
 type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
 
@@ -65,11 +68,11 @@ type TurnResult = {
   source: 'tokens' | 'estimate';
   tokens: number;
   chars: number;
-  /** Time actually spent generating: gaps between streamed characters, pauses excluded. */
+  /** Time the model spent streaming: each step from its first output to `session.step.streamed`. */
   activeMs: number;
-  /** First character to last character, pauses included. */
+  /** The turn's first output to the end of its last step's stream, pauses included. */
   wallMs: number;
-  /** `wallMs - activeMs`: tool calls, retries, and waits for the user. */
+  /** `wallMs - activeMs`: time to first token, tool calls, retries, and waits for the user. */
   pausedMs: number;
   endedAt: number;
 };
@@ -114,20 +117,27 @@ let retryDelay = RETRY_BASE_MS;
 
 // The turn in progress. A turn spans `session.execution.started` until
 // `session.execution.succeeded` / `failed` (or `session.idle` on a 1.x-shaped
-// stream). Its average divides tokens by generation time only: pauses between
-// streamed characters, whether a tool call or a wait for the user, are
-// excluded.
-let turnStartedAt: number | null = null;
-let turnLastCharAt: number | null = null;
-let turnBusyAt: number | null = null;
+// stream). Its average divides the tokens of its settled steps by the time the
+// model spent streaming them: each step from its first output (a part start or
+// a fragment) to `session.step.streamed`. Time to first token, tool execution,
+// retries, and waits for the user fall between those spans.
+//
+// Gaps between streamed characters cannot measure this. Some providers deliver
+// reasoning in one piece when the part ends, and tool input arrives with no
+// fragments at all, yet both are generated tokens.
+let turnOpenedAt: number | null = null;
+let turnClosedAt: number | null = null;
 let turnChars = 0;
 let turnTokens = 0;
-let turnActiveMs = 0;
 let turnSawTokens = false;
 let lastTurn: TurnResult | null = null;
+/** Streaming time per step of the turn, keyed by assistant message id so a retried step counts once. */
+const turnStepMs = new Map<string, number>();
+/** The step streaming now: when its first output arrived, and its latest. */
+let openStep: { messageID: string; openedAt: number; lastOutputAt: number } | null = null;
 // Pending permission and question requests for the watched session. OpenCode
-// keeps the session `busy` while an agent waits for the user; these sets are
-// what distinguishes generation from waiting.
+// keeps the session `busy` while an agent waits for the user; the panel shows
+// the wait instead of `generating`.
 const pendingPermissions = new Set<string>();
 const pendingQuestions = new Set<string>();
 
@@ -136,13 +146,13 @@ const waitingKind = (): WaitingKind | null => (
 );
 
 const clearTurn = (): void => {
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnBusyAt = null;
+  turnOpenedAt = null;
+  turnClosedAt = null;
   turnChars = 0;
   turnTokens = 0;
-  turnActiveMs = 0;
   turnSawTokens = false;
+  turnStepMs.clear();
+  openStep = null;
 };
 
 const resetMeasurement = (): void => {
@@ -160,25 +170,46 @@ const resetMeasurement = (): void => {
   lastTurn = null;
 };
 
+/** Ends the open step's generation span at `at`. */
+const closeStep = (at: number): void => {
+  if (!openStep) return;
+  turnStepMs.set(openStep.messageID, Math.max(0, at - openStep.openedAt));
+  turnClosedAt = Math.max(turnClosedAt ?? at, at);
+  openStep = null;
+};
+
+/** Model output for a step: its first output opens the step's generation span. */
+const noteOutput = (messageID: string, now: number): void => {
+  if (!messageID) return;
+  // A step that began before the last one reported its end closes that one at its last output.
+  if (openStep && openStep.messageID !== messageID) closeStep(openStep.lastOutputAt);
+  if (!openStep) {
+    openStep = { messageID, openedAt: now, lastOutputAt: now };
+    turnOpenedAt ??= now;
+  }
+  openStep.lastOutputAt = now;
+};
+
 const finalizeTurn = (now: number): void => {
-  if (turnStartedAt === null || turnLastCharAt === null || turnChars === 0) {
+  // A server that never sends `session.step.streamed` leaves the last step open.
+  if (openStep) closeStep(openStep.lastOutputAt);
+  let activeMs = 0;
+  for (const span of turnStepMs.values()) activeMs += span;
+  const source: TurnResult['source'] = turnSawTokens ? 'tokens' : 'estimate';
+  const tokens = source === 'tokens' ? turnTokens : turnChars * charsPerToken;
+  if (turnOpenedAt === null || turnClosedAt === null || activeMs < MIN_MEASURABLE_MS || tokens <= 0) {
     clearTurn();
     return;
   }
-  const wallMs = Math.max(1, turnLastCharAt - turnStartedAt);
-  // A single streamed chunk gives no gap to measure; bound the fallback by the
-  // widest gap still treated as generation.
-  const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
-  const source: TurnResult['source'] = turnSawTokens ? 'tokens' : 'estimate';
-  const tokens = source === 'tokens' ? turnTokens : turnChars * charsPerToken;
+  const wallMs = Math.max(activeMs, turnClosedAt - turnOpenedAt);
   lastTurn = {
     tokensPerSecond: tokens / (activeMs / 1000),
     source,
     tokens,
     chars: turnChars,
-    activeMs,
-    wallMs,
-    pausedMs: Math.max(0, wallMs - activeMs),
+    activeMs: Math.round(activeMs),
+    wallMs: Math.round(wallMs),
+    pausedMs: Math.round(wallMs - activeMs),
     endedAt: now,
   };
   clearTurn();
@@ -194,27 +225,12 @@ const pruneSamples = (now: number): void => {
 
 const recordChars = (messageID: string, partID: string, chars: number, now: number): void => {
   if (chars <= 0) return;
+  noteOutput(messageID, now);
   samples.push({ at: now, chars });
   if (samples.length > SAMPLE_LIMIT) samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
   lastEventAt = now;
-
-  if (turnStartedAt === null) {
-    turnStartedAt = now;
-    // Time to the first character counts only when it looks like generation
-    // rather than a pause before the model call.
-    if (turnBusyAt !== null && now - turnBusyAt <= MAX_STREAM_GAP_MS) {
-      turnActiveMs += now - turnBusyAt;
-    }
-  } else if (turnLastCharAt !== null && waitingKind() === null) {
-    // Streaming gap, so it is generation time. A wait for the user is never
-    // generation even when the user answers within the gap threshold.
-    const gap = now - turnLastCharAt;
-    if (gap <= MAX_STREAM_GAP_MS) turnActiveMs += gap;
-  }
-
-  turnLastCharAt = now;
   turnChars += chars;
 };
 
@@ -234,9 +250,33 @@ const readRecord = (value: unknown): Record<string, unknown> | null => (
     : null
 );
 
-/** Stable part identity for OpenCode 2 text and reasoning fragments. */
-const fragmentPartID = (messageID: string, kind: 'text' | 'reasoning', ordinal: unknown): string => {
+type PartKind = 'text' | 'reasoning' | 'tool';
+type PartPhase = 'started' | 'delta' | 'ended';
+
+/**
+ * The part events that carry model output. Tool input is generated text too:
+ * its tokens are in the step's `tokens.output`, so it counts like the rest.
+ */
+const PART_EVENTS: Record<string, { kind: PartKind; phase: PartPhase }> = {
+  'session.text.started': { kind: 'text', phase: 'started' },
+  'session.text.delta': { kind: 'text', phase: 'delta' },
+  'session.text.ended': { kind: 'text', phase: 'ended' },
+  'session.reasoning.started': { kind: 'reasoning', phase: 'started' },
+  'session.reasoning.delta': { kind: 'reasoning', phase: 'delta' },
+  'session.reasoning.ended': { kind: 'reasoning', phase: 'ended' },
+  'session.tool.input.started': { kind: 'tool', phase: 'started' },
+  'session.tool.input.delta': { kind: 'tool', phase: 'delta' },
+  'session.tool.input.ended': { kind: 'tool', phase: 'ended' },
+};
+
+/** Stable part identity: text and reasoning fragments by ordinal, tool input by call id. */
+const partIdOf = (kind: PartKind, messageID: string, payload: Record<string, unknown>): string => {
   if (!messageID) return '';
+  if (kind === 'tool') {
+    const callID = readString(payload.id);
+    return callID ? `${messageID}:tool:${callID}` : '';
+  }
+  const ordinal = payload.ordinal;
   const index = typeof ordinal === 'number' && Number.isInteger(ordinal) && ordinal >= 0 ? ordinal : 0;
   return `${messageID}:${kind}:${index}`;
 };
@@ -262,7 +302,7 @@ const recordTokens = (messageID: string, output: number, reasoning: number): voi
   calibrate(messageID, output, reasoning);
   const previous = stepTokens.get(messageID) ?? 0;
   stepTokens.set(messageID, generated);
-  if (turnStartedAt === null) return;
+  if (turnOpenedAt === null) return;
   turnTokens += generated - previous;
   if (generated > previous) turnSawTokens = true;
 };
@@ -278,48 +318,57 @@ const handleEvent = (event: RawEvent, now: number): void => {
 
   // --- streamed output (OpenCode 2) ---------------------------------------
 
-  if (type === 'session.text.delta' || type === 'session.reasoning.delta') {
+  const part = PART_EVENTS[type];
+  if (part) {
     if (!isWatchedSession(payload.sessionID)) return;
     const messageID = readString(payload.assistantMessageID);
-    const delta = readString(payload.delta);
-    const kind = type === 'session.reasoning.delta' ? 'reasoning' : 'text';
-    const partID = fragmentPartID(messageID, kind, payload.ordinal);
-    if (!partID || delta.length === 0) return;
-    deltaParts.add(partID);
-    recordChars(messageID, partID, delta.length, now);
-    return;
-  }
-
-  // The replayable full-value boundary of a fragment. It stands in for a
-  // service that attached after the deltas went by; a part counted through
-  // deltas is never diffed again.
-  if (type === 'session.text.ended' || type === 'session.reasoning.ended') {
-    if (!isWatchedSession(payload.sessionID)) return;
-    const messageID = readString(payload.assistantMessageID);
-    const kind = type === 'session.reasoning.ended' ? 'reasoning' : 'text';
-    const partID = fragmentPartID(messageID, kind, payload.ordinal);
+    const partID = partIdOf(part.kind, messageID, payload);
     if (!partID) return;
+    if (part.phase === 'started') {
+      noteOutput(messageID, now);
+      lastEventAt = now;
+      return;
+    }
+    if (part.phase === 'delta') {
+      const delta = readString(payload.delta);
+      if (delta.length === 0) return;
+      deltaParts.add(partID);
+      recordChars(messageID, partID, delta.length, now);
+      return;
+    }
+    // The full-value boundary of a part. Reasoning from some providers and
+    // tool input arrive only here; it also stands in for a service that
+    // attached after the deltas went by. A part counted through deltas is
+    // never diffed again.
+    noteOutput(messageID, now);
+    lastEventAt = now;
     if (deltaParts.has(partID)) return;
     const text = readString(payload.text);
     const previous = partChars.get(partID) ?? 0;
-    if (text.length <= previous) return;
-    recordChars(messageID, partID, text.length - previous, now);
+    if (text.length > previous) recordChars(messageID, partID, text.length - previous, now);
     return;
   }
 
-  // `session.tool.input.delta` and the other tool events are not generation.
+  // The model finished streaming the step. Its tools run after this, and
+  // `session.step.ended` follows them.
+  if (type === 'session.step.streamed') {
+    if (!isWatchedSession(payload.sessionID)) return;
+    if (openStep && openStep.messageID === readString(payload.assistantMessageID)) closeStep(now);
+    lastEventAt = now;
+    return;
+  }
 
   // --- real token counts (OpenCode 2) -------------------------------------
 
   if (type === 'session.step.ended' || type === 'session.step.failed') {
     if (!isWatchedSession(payload.sessionID)) return;
+    const messageID = readString(payload.assistantMessageID);
+    // Without `session.step.streamed`, the stream ended at the step's last
+    // output; this event arrives only after the step's tools ran.
+    if (openStep && openStep.messageID === messageID) closeStep(openStep.lastOutputAt);
     const tokens = readRecord(payload.tokens);
     if (!tokens) return;
-    recordTokens(
-      readString(payload.assistantMessageID),
-      readNumber(tokens.output),
-      readNumber(tokens.reasoning),
-    );
+    recordTokens(messageID, readNumber(tokens.output), readNumber(tokens.reasoning));
     return;
   }
 
@@ -347,8 +396,6 @@ const handleEvent = (event: RawEvent, now: number): void => {
 
   if (type === 'session.execution.started') {
     if (!isWatchedSession(payload.sessionID)) return;
-    // Mark where the turn began so time to first token can be judged.
-    if (turnStartedAt === null) turnBusyAt = now;
     busy = true;
     lastEventAt = now;
     return;
@@ -434,7 +481,6 @@ const handleEvent = (event: RawEvent, now: number): void => {
     const status = readRecord(payload.status);
     const nextBusy = status?.type === 'busy' || status?.type === 'retry';
     if (busy && !nextBusy) finalizeTurn(now);
-    if (nextBusy && turnStartedAt === null) turnBusyAt = now;
     busy = nextBusy;
     lastEventAt = now;
     return;
@@ -651,7 +697,8 @@ const server = http.createServer((req, res) => {
       error: lastError,
       sessionId: watch?.sessionId ?? null,
       busy,
-      active: now - lastEventAt < 2_000,
+      // Tool input can stream for seconds with no event; an open step is still generating.
+      active: openStep !== null || now - lastEventAt < ACTIVE_HOLD_MS,
       lastEventAt: lastEventAt || null,
       windowMs: WINDOW_MS,
       chars: rate.chars,

@@ -15,7 +15,8 @@ var MIN_CHARS_PER_TOKEN = 0.05;
 var MAX_CHARS_PER_TOKEN = 1;
 var CALIBRATION_WEIGHT = 0.3;
 var MIN_CALIBRATION_CHARS = 40;
-var MAX_STREAM_GAP_MS = 1000;
+var MIN_MEASURABLE_MS = 100;
+var ACTIVE_HOLD_MS = 2000;
 var samples = [];
 var partChars = new Map;
 var deltaParts = new Set;
@@ -33,25 +34,25 @@ var sessionUsage = null;
 var controller = null;
 var retryTimer = null;
 var retryDelay = RETRY_BASE_MS;
-var turnStartedAt = null;
-var turnLastCharAt = null;
-var turnBusyAt = null;
+var turnOpenedAt = null;
+var turnClosedAt = null;
 var turnChars = 0;
 var turnTokens = 0;
-var turnActiveMs = 0;
 var turnSawTokens = false;
 var lastTurn = null;
+var turnStepMs = new Map;
+var openStep = null;
 var pendingPermissions = new Set;
 var pendingQuestions = new Set;
 var waitingKind = () => pendingPermissions.size > 0 ? "permission" : pendingQuestions.size > 0 ? "question" : null;
 var clearTurn = () => {
-  turnStartedAt = null;
-  turnLastCharAt = null;
-  turnBusyAt = null;
+  turnOpenedAt = null;
+  turnClosedAt = null;
   turnChars = 0;
   turnTokens = 0;
-  turnActiveMs = 0;
   turnSawTokens = false;
+  turnStepMs.clear();
+  openStep = null;
 };
 var resetMeasurement = () => {
   samples.length = 0;
@@ -67,23 +68,45 @@ var resetMeasurement = () => {
   pendingQuestions.clear();
   lastTurn = null;
 };
+var closeStep = (at) => {
+  if (!openStep)
+    return;
+  turnStepMs.set(openStep.messageID, Math.max(0, at - openStep.openedAt));
+  turnClosedAt = Math.max(turnClosedAt ?? at, at);
+  openStep = null;
+};
+var noteOutput = (messageID, now) => {
+  if (!messageID)
+    return;
+  if (openStep && openStep.messageID !== messageID)
+    closeStep(openStep.lastOutputAt);
+  if (!openStep) {
+    openStep = { messageID, openedAt: now, lastOutputAt: now };
+    turnOpenedAt ??= now;
+  }
+  openStep.lastOutputAt = now;
+};
 var finalizeTurn = (now) => {
-  if (turnStartedAt === null || turnLastCharAt === null || turnChars === 0) {
+  if (openStep)
+    closeStep(openStep.lastOutputAt);
+  let activeMs = 0;
+  for (const span of turnStepMs.values())
+    activeMs += span;
+  const source = turnSawTokens ? "tokens" : "estimate";
+  const tokens = source === "tokens" ? turnTokens : turnChars * charsPerToken;
+  if (turnOpenedAt === null || turnClosedAt === null || activeMs < MIN_MEASURABLE_MS || tokens <= 0) {
     clearTurn();
     return;
   }
-  const wallMs = Math.max(1, turnLastCharAt - turnStartedAt);
-  const activeMs = turnActiveMs > 0 ? Math.round(turnActiveMs) : Math.min(wallMs, MAX_STREAM_GAP_MS);
-  const source = turnSawTokens ? "tokens" : "estimate";
-  const tokens = source === "tokens" ? turnTokens : turnChars * charsPerToken;
+  const wallMs = Math.max(activeMs, turnClosedAt - turnOpenedAt);
   lastTurn = {
     tokensPerSecond: tokens / (activeMs / 1000),
     source,
     tokens,
     chars: turnChars,
-    activeMs,
-    wallMs,
-    pausedMs: Math.max(0, wallMs - activeMs),
+    activeMs: Math.round(activeMs),
+    wallMs: Math.round(wallMs),
+    pausedMs: Math.round(wallMs - activeMs),
     endedAt: now
   };
   clearTurn();
@@ -99,32 +122,38 @@ var pruneSamples = (now) => {
 var recordChars = (messageID, partID, chars, now) => {
   if (chars <= 0)
     return;
+  noteOutput(messageID, now);
   samples.push({ at: now, chars });
   if (samples.length > SAMPLE_LIMIT)
     samples.splice(0, samples.length - SAMPLE_LIMIT);
   partChars.set(partID, (partChars.get(partID) ?? 0) + chars);
   messageChars.set(messageID, (messageChars.get(messageID) ?? 0) + chars);
   lastEventAt = now;
-  if (turnStartedAt === null) {
-    turnStartedAt = now;
-    if (turnBusyAt !== null && now - turnBusyAt <= MAX_STREAM_GAP_MS) {
-      turnActiveMs += now - turnBusyAt;
-    }
-  } else if (turnLastCharAt !== null && waitingKind() === null) {
-    const gap = now - turnLastCharAt;
-    if (gap <= MAX_STREAM_GAP_MS)
-      turnActiveMs += gap;
-  }
-  turnLastCharAt = now;
   turnChars += chars;
 };
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && watch !== null && watch.sessionId !== null && sessionID === watch.sessionId;
 var readString = (value) => typeof value === "string" ? value : "";
 var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
 var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
-var fragmentPartID = (messageID, kind, ordinal) => {
+var PART_EVENTS = {
+  "session.text.started": { kind: "text", phase: "started" },
+  "session.text.delta": { kind: "text", phase: "delta" },
+  "session.text.ended": { kind: "text", phase: "ended" },
+  "session.reasoning.started": { kind: "reasoning", phase: "started" },
+  "session.reasoning.delta": { kind: "reasoning", phase: "delta" },
+  "session.reasoning.ended": { kind: "reasoning", phase: "ended" },
+  "session.tool.input.started": { kind: "tool", phase: "started" },
+  "session.tool.input.delta": { kind: "tool", phase: "delta" },
+  "session.tool.input.ended": { kind: "tool", phase: "ended" }
+};
+var partIdOf = (kind, messageID, payload) => {
   if (!messageID)
     return "";
+  if (kind === "tool") {
+    const callID = readString(payload.id);
+    return callID ? `${messageID}:tool:${callID}` : "";
+  }
+  const ordinal = payload.ordinal;
   const index = typeof ordinal === "number" && Number.isInteger(ordinal) && ordinal >= 0 ? ordinal : 0;
   return `${messageID}:${kind}:${index}`;
 };
@@ -145,7 +174,7 @@ var recordTokens = (messageID, output, reasoning) => {
   calibrate(messageID, output, reasoning);
   const previous = stepTokens.get(messageID) ?? 0;
   stepTokens.set(messageID, generated);
-  if (turnStartedAt === null)
+  if (turnOpenedAt === null)
     return;
   turnTokens += generated - previous;
   if (generated > previous)
@@ -158,43 +187,55 @@ var handleEvent = (event, now) => {
   const payload = readRecord(event.data) ?? readRecord(event.properties);
   if (!payload)
     return;
-  if (type === "session.text.delta" || type === "session.reasoning.delta") {
+  const part = PART_EVENTS[type];
+  if (part) {
     if (!isWatchedSession(payload.sessionID))
       return;
     const messageID = readString(payload.assistantMessageID);
-    const delta = readString(payload.delta);
-    const kind = type === "session.reasoning.delta" ? "reasoning" : "text";
-    const partID = fragmentPartID(messageID, kind, payload.ordinal);
-    if (!partID || delta.length === 0)
-      return;
-    deltaParts.add(partID);
-    recordChars(messageID, partID, delta.length, now);
-    return;
-  }
-  if (type === "session.text.ended" || type === "session.reasoning.ended") {
-    if (!isWatchedSession(payload.sessionID))
-      return;
-    const messageID = readString(payload.assistantMessageID);
-    const kind = type === "session.reasoning.ended" ? "reasoning" : "text";
-    const partID = fragmentPartID(messageID, kind, payload.ordinal);
+    const partID = partIdOf(part.kind, messageID, payload);
     if (!partID)
       return;
+    if (part.phase === "started") {
+      noteOutput(messageID, now);
+      lastEventAt = now;
+      return;
+    }
+    if (part.phase === "delta") {
+      const delta = readString(payload.delta);
+      if (delta.length === 0)
+        return;
+      deltaParts.add(partID);
+      recordChars(messageID, partID, delta.length, now);
+      return;
+    }
+    noteOutput(messageID, now);
+    lastEventAt = now;
     if (deltaParts.has(partID))
       return;
     const text = readString(payload.text);
     const previous = partChars.get(partID) ?? 0;
-    if (text.length <= previous)
+    if (text.length > previous)
+      recordChars(messageID, partID, text.length - previous, now);
+    return;
+  }
+  if (type === "session.step.streamed") {
+    if (!isWatchedSession(payload.sessionID))
       return;
-    recordChars(messageID, partID, text.length - previous, now);
+    if (openStep && openStep.messageID === readString(payload.assistantMessageID))
+      closeStep(now);
+    lastEventAt = now;
     return;
   }
   if (type === "session.step.ended" || type === "session.step.failed") {
     if (!isWatchedSession(payload.sessionID))
       return;
+    const messageID = readString(payload.assistantMessageID);
+    if (openStep && openStep.messageID === messageID)
+      closeStep(openStep.lastOutputAt);
     const tokens = readRecord(payload.tokens);
     if (!tokens)
       return;
-    recordTokens(readString(payload.assistantMessageID), readNumber(tokens.output), readNumber(tokens.reasoning));
+    recordTokens(messageID, readNumber(tokens.output), readNumber(tokens.reasoning));
     return;
   }
   if (type === "session.usage.updated") {
@@ -221,8 +262,6 @@ var handleEvent = (event, now) => {
   if (type === "session.execution.started") {
     if (!isWatchedSession(payload.sessionID))
       return;
-    if (turnStartedAt === null)
-      turnBusyAt = now;
     busy = true;
     lastEventAt = now;
     return;
@@ -307,8 +346,6 @@ var handleEvent = (event, now) => {
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
-    if (nextBusy && turnStartedAt === null)
-      turnBusyAt = now;
     busy = nextBusy;
     lastEventAt = now;
     return;
@@ -516,7 +553,7 @@ var server = http.createServer((req, res) => {
       error: lastError,
       sessionId: watch?.sessionId ?? null,
       busy,
-      active: now - lastEventAt < 2000,
+      active: openStep !== null || now - lastEventAt < ACTIVE_HOLD_MS,
       lastEventAt: lastEventAt || null,
       windowMs: WINDOW_MS,
       chars: rate.chars,

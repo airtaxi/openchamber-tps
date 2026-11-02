@@ -1,9 +1,10 @@
 // Smoke test for the TPS Meter service.
 //
 // Starts a mock OpenChamber event stream and the built service, feeds it
-// OpenCode 2 wire events (`session.text.delta`, `session.step.ended`,
-// `session.execution.*`, ...) with the same envelopes the real stream uses,
-// and checks the rolling rate, the direct token counts, and the turn average.
+// OpenCode 2 wire events (`session.text.*`, `session.reasoning.*`,
+// `session.tool.input.*`, `session.step.*`, `session.execution.*`, ...) with
+// the same envelopes and in the same order the real stream uses, and checks
+// the rolling rate, the direct token counts, and the turn average.
 // Run with `bun scripts/smoke.mjs` or `node scripts/smoke.mjs` from the
 // extension folder.
 import http from 'node:http';
@@ -104,21 +105,27 @@ try {
 
   emit('session.execution.started', { sessionID: SESSION });
 
-  // 400 counted characters over ~0.5 s inside the watched session.
-  for (let index = 0; index < 10; index += 1) {
-    emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
-    // Ignored: another session, and tool-input fragments (not generation).
-    emit('session.text.delta', { sessionID: 'ses_other', assistantMessageID: 'msg_1', ordinal: 0, delta: 'y'.repeat(500) });
-    emit('session.tool.input.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1', delta: 'z'.repeat(500) });
-    await wait(50);
-  }
+  // Step 1 in the order a real stream sends it: reasoning arrives in one piece
+  // when the part ends, and tool input arrives with no fragments at all. Both
+  // are generated tokens, so the step's whole stream counts as generation.
+  emit('session.step.started', { sessionID: SESSION, assistantMessageID: 'msg_1' });
+  emit('session.reasoning.started', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0 });
+  // Ignored: another session.
+  emit('session.text.delta', { sessionID: 'ses_other', assistantMessageID: 'msg_x', ordinal: 0, delta: 'y'.repeat(500) });
+  await wait(300);
+  emit('session.reasoning.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'r'.repeat(200) });
+  emit('session.reasoning.ended', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, text: 'r'.repeat(200) });
+  emit('session.tool.input.started', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1', name: 'bash' });
+  await wait(400);
+  emit('session.tool.input.ended', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1', text: 'z'.repeat(300) });
+  emit('session.step.streamed', { sessionID: SESSION, assistantMessageID: 'msg_1' });
 
-  await wait(200);
+  await wait(100);
   const rate = await call('/rate');
   assert(rate.status === 200, 'rate should answer');
   assert(rate.body.sessionId === SESSION, 'rate should report the watched session');
-  assert(rate.body.chars === 400, `expected 400 counted characters, got ${rate.body.chars}`);
-  assert(Math.abs(rate.body.charsPerSecond - 80) < 1, `expected ~80 chars/s, got ${rate.body.charsPerSecond}`);
+  assert(rate.body.chars === 500, `expected reasoning and tool input to count, 500 characters, got ${rate.body.chars}`);
+  assert(Math.abs(rate.body.charsPerSecond - 100) < 1, `expected ~100 chars/s, got ${rate.body.charsPerSecond}`);
   assert(rate.body.tokensPerSecond > 0, 'tokens per second should be positive');
   assert(rate.body.busy === true, 'busy should follow session.execution.started');
   assert(rate.body.eventsSeen > 0, 'the stream counter should grow');
@@ -126,18 +133,28 @@ try {
   assert(rate.body.waiting === null, 'no wait should be reported while generating');
   assert(rate.body.sessionUsage === null, 'session totals should be empty before the first settled step');
 
-  // The agent asks for permission and stops generating. OpenCode keeps the
-  // session busy while it waits, so only the pause accounting keeps this out of
-  // the turn average.
+  // The tool runs and asks for permission. OpenCode keeps the session busy
+  // while it waits; the wait falls outside every step's stream.
+  emit('session.tool.called', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1' });
   emit('permission.asked', { id: 'per_1', sessionID: SESSION, action: 'bash' });
-  await wait(400);
+  await wait(50);
   assert((await call('/rate')).body.waiting === 'permission', 'a pending permission should be reported');
-  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
+  await wait(350);
   emit('permission.replied', { sessionID: SESSION, requestID: 'per_1', reply: 'once' });
-  await wait(50);
-  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
-  await wait(50);
-  emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_1', ordinal: 0, delta: 'x'.repeat(40) });
+  emit('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1' });
+
+  // The step settles after its tool ran, with the provider's real token
+  // counts, which recalibrate chars-per-token.
+  emit('session.step.ended', {
+    sessionID: SESSION,
+    assistantMessageID: 'msg_1',
+    finish: 'tool-calls',
+    cost: 0.01,
+    tokens: { input: 900, output: 120, reasoning: 40, cache: { read: 0, write: 0 } },
+  });
+  await wait(100);
+  const calibrated = await call('/rate');
+  assert(calibrated.body.charsPerToken > 0.25, `expected calibration above the default, got ${calibrated.body.charsPerToken}`);
 
   // The question tool arrives as a form on OpenCode 2.
   emit('form.created', { form: { id: 'frm_1', sessionID: SESSION, title: 'Pick one' } });
@@ -147,18 +164,22 @@ try {
   await wait(50);
   assert((await call('/rate')).body.waiting === null, 'a resolved form should clear the wait');
 
-  // A settled step carries the provider's real token counts and recalibrates
-  // chars-per-token.
+  // Step 2: the reply streams as text fragments.
+  emit('session.step.started', { sessionID: SESSION, assistantMessageID: 'msg_2' });
+  emit('session.text.started', { sessionID: SESSION, assistantMessageID: 'msg_2', ordinal: 0 });
+  for (let index = 0; index < 10; index += 1) {
+    emit('session.text.delta', { sessionID: SESSION, assistantMessageID: 'msg_2', ordinal: 0, delta: 'x'.repeat(40) });
+    await wait(50);
+  }
+  emit('session.text.ended', { sessionID: SESSION, assistantMessageID: 'msg_2', ordinal: 0, text: 'x'.repeat(400) });
+  emit('session.step.streamed', { sessionID: SESSION, assistantMessageID: 'msg_2' });
   emit('session.step.ended', {
     sessionID: SESSION,
-    assistantMessageID: 'msg_1',
+    assistantMessageID: 'msg_2',
     finish: 'stop',
     cost: 0.01,
-    tokens: { input: 900, output: 120, reasoning: 40, cache: { read: 0, write: 0 } },
+    tokens: { input: 950, output: 100, reasoning: 0, cache: { read: 0, write: 0 } },
   });
-  await wait(100);
-  const calibrated = await call('/rate');
-  assert(calibrated.body.charsPerToken > 0.25, `expected calibration above the default, got ${calibrated.body.charsPerToken}`);
 
   // Session-cumulative usage is reported as-is, so the panel can show real
   // session totals next to the estimate.
@@ -181,11 +202,13 @@ try {
   const turn = idle.body.lastTurn;
   assert(turn, 'a finished turn should be reported');
   assert(turn.source === 'tokens', `expected real token counts, got ${turn.source}`);
-  assert(turn.tokens === 160, `expected 160 turn tokens, got ${turn.tokens}`);
-  assert(turn.chars === 520, `expected 520 counted characters, got ${turn.chars}`);
-  assert(turn.activeMs > 0, 'active time should be positive');
-  assert(turn.wallMs > turn.activeMs, 'the wait should make wall time exceed generation time');
-  assert(turn.pausedMs >= 350, `expected the wait to be excluded, paused ${turn.pausedMs} ms`);
+  assert(turn.tokens === 260, `expected 260 turn tokens, got ${turn.tokens}`);
+  assert(turn.chars === 900, `expected 900 counted characters, got ${turn.chars}`);
+  // Step 1 streams for ~700 ms without a single gap between fragments, and
+  // step 2 for ~500 ms. Both count.
+  assert(turn.activeMs >= 1_000, `expected both steps' streams as generation time, got ${turn.activeMs} ms`);
+  assert(turn.wallMs > turn.activeMs, 'the tool run and the waits should make wall time exceed generation time');
+  assert(turn.pausedMs >= 450, `expected the tool run and the waits to be excluded, paused ${turn.pausedMs} ms`);
   assert(
     turn.tokensPerSecond > turn.tokens / (turn.wallMs / 1000),
     'the average should divide by generation time only',
@@ -220,6 +243,7 @@ try {
   const fallback = await call('/rate');
   assert(fallback.body.busy === false, 'busy should clear after the resumed turn ends');
   assert(fallback.body.chars === 400, `expected 400 characters from the full-value boundary, got ${fallback.body.chars}`);
+  assert(fallback.body.lastTurn === null, 'a turn seen only through finished parts has no timing to report');
 
   console.log('turn:', JSON.stringify(turn));
   console.log('usage:', JSON.stringify(usage.body.sessionUsage));
