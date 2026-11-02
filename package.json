@@ -1,6 +1,6 @@
 {
   "name": "openchamber-tps",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -24,7 +24,7 @@
       "statusSection": {
         "entry": "status/index.html",
         "title": "TPS",
-        "height": 72
+        "height": 96
       },
       "service": {
         "entry": "service/main.js",

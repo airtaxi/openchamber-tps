@@ -22,6 +22,7 @@ const COPY = {
     live: 'Live',
     lastTurn: 'Last turn',
     session: 'Session',
+    ratio: 'Tokens/char',
     unit: 'tok/s',
     tokens: 'tok',
     measuring: 'measuring',
@@ -32,6 +33,7 @@ const COPY = {
     reconnecting: 'Reconnecting to the event stream.',
     liveTip: 'Tokens per second over the last 5 seconds, estimated from streamed characters.',
     sessionTip: 'Tokens the model generated in this session, output and reasoning together.',
+    ratioTip: 'Model tokens per streamed character, calibrated from finished model calls. The live rate is characters per second times this value.',
     generating: 'Generating',
     paused: 'paused',
     estimated: 'Estimated from streamed characters.',
@@ -40,6 +42,7 @@ const COPY = {
     live: '실시간',
     lastTurn: '지난 턴',
     session: '세션',
+    ratio: '문자당 토큰',
     unit: 'tok/s',
     tokens: 'tok',
     measuring: '측정 중',
@@ -50,6 +53,7 @@ const COPY = {
     reconnecting: '이벤트 스트림에 다시 연결하는 중입니다.',
     liveTip: '최근 5초 동안의 초당 토큰 수입니다. 스트리밍된 문자 수로 추정합니다.',
     sessionTip: '이 세션에서 모델이 생성한 토큰 수입니다. 출력과 추론을 합산합니다.',
+    ratioTip: '스트리밍된 문자 하나당 모델 토큰 수입니다. 끝난 모델 호출의 실제 토큰으로 보정하며, 실시간 값은 초당 문자 수에 이 값을 곱해 구합니다.',
     generating: '생성',
     paused: '대기',
     estimated: '스트리밍된 문자 수로 추정한 값입니다.',
@@ -85,8 +89,9 @@ const turnDetail = el('span', 'tps-detail');
 const turn = line(turnDetail);
 
 const session = line(el('span'));
+const ratio = line(el('span'));
 
-const lines = [live.row, turn.row, session.row];
+const lines = [live.row, turn.row, session.row, ratio.row];
 root.append(note, ...lines);
 
 // ----- State -----
@@ -104,8 +109,10 @@ const applyCopy = (): void => {
   live.label.textContent = copy.live;
   turn.label.textContent = copy.lastTurn;
   session.label.textContent = copy.session;
+  ratio.label.textContent = copy.ratio;
   live.row.title = copy.liveTip;
   session.row.title = copy.sessionTip;
+  ratio.row.title = copy.ratioTip;
 };
 
 type NoteTone = 'muted' | 'warning';
@@ -157,6 +164,9 @@ const render = (rate: RateResponse | null): void => {
   const usage = rate?.sessionUsage ?? null;
   session.value.textContent = usage ? `${formatCount(usage.generated)} ${copy.tokens}` : '—';
   session.value.dataset.quiet = String(!usage);
+
+  ratio.value.textContent = rate ? rate.charsPerToken.toFixed(3) : '—';
+  ratio.value.dataset.quiet = String(!rate);
 };
 
 // ----- Service -----
