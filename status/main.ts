@@ -22,6 +22,7 @@ const COPY = {
     live: 'Live',
     lastTurn: 'Last turn',
     session: 'Session',
+    chars: 'Chars/s',
     ratio: 'Tokens/char',
     unit: 'tok/s',
     tokens: 'tok',
@@ -33,6 +34,7 @@ const COPY = {
     reconnecting: 'Reconnecting to the event stream.',
     liveTip: 'Tokens per second over the last 5 seconds, estimated from streamed characters.',
     sessionTip: 'Tokens the model generated in this session, output and reasoning together.',
+    charsTip: 'Streamed characters per second over the last 5 seconds, counting text, reasoning, and tool input. The live rate is computed from this measured value.',
     ratioTip: 'Model tokens per streamed character, calibrated from finished model calls. The live rate is characters per second times this value.',
     generating: 'Generating',
     paused: 'paused',
@@ -42,6 +44,7 @@ const COPY = {
     live: '실시간',
     lastTurn: '지난 턴',
     session: '세션',
+    chars: '초당 문자 수',
     ratio: '문자당 토큰',
     unit: 'tok/s',
     tokens: 'tok',
@@ -53,6 +56,7 @@ const COPY = {
     reconnecting: '이벤트 스트림에 다시 연결하는 중입니다.',
     liveTip: '최근 5초 동안의 초당 토큰 수입니다. 스트리밍된 문자 수로 추정합니다.',
     sessionTip: '이 세션에서 모델이 생성한 토큰 수입니다. 출력과 추론을 합산합니다.',
+    charsTip: '최근 5초 동안 스트리밍된 초당 문자 수입니다. 텍스트, 추론, 도구 입력을 모두 세며, 실시간 토큰 속도는 이 실측값으로 계산합니다.',
     ratioTip: '스트리밍된 문자 하나당 모델 토큰 수입니다. 끝난 모델 호출의 실제 토큰으로 보정하며, 실시간 값은 초당 문자 수에 이 값을 곱해 구합니다.',
     generating: '생성',
     paused: '대기',
@@ -89,9 +93,10 @@ const turnDetail = el('span', 'tps-detail');
 const turn = line(turnDetail);
 
 const session = line(el('span'));
+const chars = line(el('span'));
 const ratio = line(el('span'));
 
-const lines = [live.row, turn.row, session.row, ratio.row];
+const lines = [live.row, turn.row, session.row, chars.row, ratio.row];
 root.append(note, ...lines);
 
 // ----- State -----
@@ -109,9 +114,11 @@ const applyCopy = (): void => {
   live.label.textContent = copy.live;
   turn.label.textContent = copy.lastTurn;
   session.label.textContent = copy.session;
+  chars.label.textContent = copy.chars;
   ratio.label.textContent = copy.ratio;
   live.row.title = copy.liveTip;
   session.row.title = copy.sessionTip;
+  chars.row.title = copy.charsTip;
   ratio.row.title = copy.ratioTip;
 };
 
@@ -146,7 +153,12 @@ const render = (rate: RateResponse | null): void => {
   fill.style.transform = `scaleX(${share.toFixed(4)})`;
   live.value.textContent = rate ? `${tps.toFixed(1)} ${copy.unit}` : '—';
   // Between turns the number is the tail of the window, not a live rate.
-  live.value.dataset.quiet = String(!(rate?.busy && rate.active));
+  const quiet = String(!(rate?.busy && rate.active));
+  live.value.dataset.quiet = quiet;
+
+  const charsPerSecond = rate && Number.isFinite(rate.charsPerSecond) ? rate.charsPerSecond : 0;
+  chars.value.textContent = rate ? charsPerSecond.toFixed(1) : '—';
+  chars.value.dataset.quiet = quiet;
 
   const last = rate?.lastTurn ?? null;
   if (rate && last) {

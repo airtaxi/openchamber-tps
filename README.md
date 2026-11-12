@@ -31,13 +31,14 @@ service does the measuring.
 
 ### Work Status section
 
-The chat's Work Status panel gets a **TPS** section with four lines:
+The chat's Work Status panel gets a **TPS** section with five lines:
 
 | Line | Shows |
 | --- | --- |
 | Live | The rolling 5-second `tok/s` and a bar against the recent peak. The number turns muted between turns. |
 | Last turn | The finished turn's tokens over its generation time, and its average `tok/s`. A `~` marks a character estimate; hover for the active and paused time. |
 | Session | Tokens generated in the session so far (`output + reasoning`). |
+| Chars/s | Streamed characters per second over the same 5-second window: text, reasoning, and tool input. This is the measured value the live number is computed from, and it turns muted between turns like the live number. |
 | Tokens/char | The calibrated ratio behind the live number: model tokens per streamed character. Hover for how the live rate uses it. |
 
 Problems that stop the measurement (the service is not approved, the surface
