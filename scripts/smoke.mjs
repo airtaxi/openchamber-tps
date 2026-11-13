@@ -1,10 +1,16 @@
 // Smoke test for the TPS Meter service.
 //
-// Starts a mock OpenChamber event stream and the built service, feeds it
-// OpenCode 2 wire events (`session.text.*`, `session.reasoning.*`,
-// `session.tool.input.*`, `session.step.*`, `session.execution.*`, ...) with
-// the same envelopes and in the same order the real stream uses, and checks
-// the rolling rate, the direct token counts, and the turn average.
+// Starts a mock OpenCode event stream and the built service, feeds it OpenCode
+// 2 wire events (`session.text.*`, `session.reasoning.*`, `session.tool.input.*`,
+// `session.step.*`, `session.execution.*`, ...) with the same envelopes and in
+// the same order the real stream uses, and checks the rolling rate, the direct
+// token counts, and the turn average.
+//
+// The first service runs as a 2.7.0 host starts it: OPENCHAMBER_OPENCODE_URL
+// points at the mock and the service token is its bearer. A second service
+// without that URL covers the OpenChamber proxy fallback, and a third covers
+// the blocked state when neither source exists.
+//
 // Run with `bun scripts/smoke.mjs` or `node scripts/smoke.mjs` from the
 // extension folder.
 import http from 'node:http';
@@ -16,15 +22,18 @@ const here = dirname(fileURLToPath(import.meta.url));
 const serviceEntry = resolve(here, '..', 'service', 'main.js');
 const TOKEN = 'smoke-token';
 const MOCK_PORT = 39081;
-const SERVICE_PORT = 39082;
+const PRIMARY_PORT = 39082;
+const FALLBACK_PORT = 39083;
+const BLOCKED_PORT = 39084;
 const SESSION = 'ses_smoke';
+const FALLBACK_SESSION = 'ses_fallback_service';
 
 const streamClients = new Set();
-const requestedPaths = [];
+const requested = [];
 
 const mock = http.createServer((req, res) => {
-  requestedPaths.push(req.url);
-  if (req.url !== '/api/global/event') {
+  requested.push({ path: req.url, authorization: req.headers.authorization ?? null });
+  if (req.url !== '/api/event' && req.url !== '/api/global/event') {
     res.writeHead(404).end();
     return;
   }
@@ -44,8 +53,8 @@ const emit = (type, data) => {
 
 const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 
-const call = async (path, init) => {
-  const response = await fetch(`http://127.0.0.1:${SERVICE_PORT}${path}`, {
+const call = async (port, path, init) => {
+  const response = await fetch(`http://127.0.0.1:${port}${path}`, {
     ...init,
     headers: { Authorization: `Bearer ${TOKEN}`, ...(init?.headers ?? {}) },
   });
@@ -56,51 +65,70 @@ const assert = (condition, message) => {
   if (!condition) throw new Error(`FAILED: ${message}`);
 };
 
-await new Promise((done) => mock.listen(MOCK_PORT, '127.0.0.1', done));
+const children = [];
+const startService = (port, extraEnv = {}) => {
+  const child = spawn(process.execPath, [serviceEntry], {
+    env: {
+      ...process.env,
+      OPENCHAMBER_SERVICE_PORT: String(port),
+      OPENCHAMBER_SERVICE_TOKEN: TOKEN,
+      ...extraEnv,
+    },
+    stdio: 'inherit',
+  });
+  children.push(child);
+  return child;
+};
 
-const child = spawn(process.execPath, [serviceEntry], {
-  env: {
-    ...process.env,
-    OPENCHAMBER_SERVICE_PORT: String(SERVICE_PORT),
-    OPENCHAMBER_SERVICE_TOKEN: TOKEN,
-  },
-  stdio: 'inherit',
-});
-
-try {
+const waitForHealth = async (port) => {
   let health = null;
   for (let attempt = 0; attempt < 40 && !health; attempt += 1) {
     await wait(150);
     try {
-      health = await call('/health');
+      health = await call(port, '/health');
     } catch {
       health = null;
     }
   }
-  assert(health?.status === 200, 'service should answer /health');
+  assert(health?.status === 200, `service on ${port} should answer /health`);
+};
 
-  const unauthorized = await fetch(`http://127.0.0.1:${SERVICE_PORT}/health`);
-  assert(unauthorized.status === 401, 'service should reject a request without the token');
-
-  const watch = await call('/watch', {
-    method: 'POST',
-    body: JSON.stringify({ origin: `http://127.0.0.1:${MOCK_PORT}`, sessionId: SESSION }),
-  });
-  assert(watch.status === 200, 'watch should be accepted');
-
-  let live = null;
+const waitForLive = async (port) => {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     await wait(100);
-    const rate = await call('/rate');
-    if (rate.body.connection === 'live') {
-      live = rate.body;
-      break;
-    }
+    const rate = await call(port, '/rate');
+    if (rate.body.connection === 'live') return rate.body;
   }
+  return null;
+};
+
+await new Promise((done) => mock.listen(MOCK_PORT, '127.0.0.1', done));
+
+const primary = startService(PRIMARY_PORT, {
+  OPENCHAMBER_OPENCODE_URL: `http://127.0.0.1:${MOCK_PORT}`,
+});
+
+try {
+  await waitForHealth(PRIMARY_PORT);
+
+  const unauthorized = await fetch(`http://127.0.0.1:${PRIMARY_PORT}/health`);
+  assert(unauthorized.status === 401, 'service should reject a request without the token');
+
+  const watch = await call(PRIMARY_PORT, '/watch', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId: SESSION }),
+  });
+  assert(watch.status === 200, 'watch should be accepted without an origin');
+
+  const live = await waitForLive(PRIMARY_PORT);
   assert(live, 'service should connect to the event stream');
   assert(
-    requestedPaths.every((path) => path === '/api/global/event'),
-    `service must use the global stream, saw ${requestedPaths.join(', ')}`,
+    requested.every((entry) => entry.path === '/api/event'),
+    `service must use the host's OpenCode stream, saw ${requested.map((entry) => entry.path).join(', ')}`,
+  );
+  assert(
+    requested.every((entry) => entry.authorization === `Bearer ${TOKEN}`),
+    'the host OpenCode access should receive the service token as its bearer',
   );
 
   emit('session.execution.started', { sessionID: SESSION });
@@ -121,7 +149,7 @@ try {
   emit('session.step.streamed', { sessionID: SESSION, assistantMessageID: 'msg_1' });
 
   await wait(100);
-  const rate = await call('/rate');
+  const rate = await call(PRIMARY_PORT, '/rate');
   assert(rate.status === 200, 'rate should answer');
   assert(rate.body.sessionId === SESSION, 'rate should report the watched session');
   assert(rate.body.chars === 500, `expected reasoning and tool input to count, 500 characters, got ${rate.body.chars}`);
@@ -138,7 +166,7 @@ try {
   emit('session.tool.called', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1' });
   emit('permission.asked', { id: 'per_1', sessionID: SESSION, action: 'bash' });
   await wait(50);
-  assert((await call('/rate')).body.waiting === 'permission', 'a pending permission should be reported');
+  assert((await call(PRIMARY_PORT, '/rate')).body.waiting === 'permission', 'a pending permission should be reported');
   await wait(350);
   emit('permission.replied', { sessionID: SESSION, requestID: 'per_1', reply: 'once' });
   emit('session.tool.success', { sessionID: SESSION, assistantMessageID: 'msg_1', id: 'call_1' });
@@ -153,16 +181,16 @@ try {
     tokens: { input: 900, output: 120, reasoning: 40, cache: { read: 0, write: 0 } },
   });
   await wait(100);
-  const calibrated = await call('/rate');
+  const calibrated = await call(PRIMARY_PORT, '/rate');
   assert(calibrated.body.charsPerToken > 0.25, `expected calibration above the default, got ${calibrated.body.charsPerToken}`);
 
   // The question tool arrives as a form on OpenCode 2.
   emit('form.created', { form: { id: 'frm_1', sessionID: SESSION, title: 'Pick one' } });
   await wait(50);
-  assert((await call('/rate')).body.waiting === 'question', 'a pending form should be reported');
+  assert((await call(PRIMARY_PORT, '/rate')).body.waiting === 'question', 'a pending form should be reported');
   emit('form.replied', { id: 'frm_1', sessionID: SESSION, answer: {} });
   await wait(50);
-  assert((await call('/rate')).body.waiting === null, 'a resolved form should clear the wait');
+  assert((await call(PRIMARY_PORT, '/rate')).body.waiting === null, 'a resolved form should clear the wait');
 
   // Step 2: the reply streams as text fragments.
   emit('session.step.started', { sessionID: SESSION, assistantMessageID: 'msg_2' });
@@ -189,13 +217,13 @@ try {
     tokens: { input: 1000, output: 200, reasoning: 60, cache: { read: 0, write: 0 } },
   });
   await wait(100);
-  const usage = await call('/rate');
+  const usage = await call(PRIMARY_PORT, '/rate');
   assert(usage.body.sessionUsage?.generated === 260, `expected 260 generated session tokens, got ${usage.body.sessionUsage?.generated}`);
   assert(usage.body.sessionUsage?.cost === 0.02, `expected the session cost, got ${usage.body.sessionUsage?.cost}`);
 
   emit('session.execution.succeeded', { sessionID: SESSION });
   await wait(100);
-  const idle = await call('/rate');
+  const idle = await call(PRIMARY_PORT, '/rate');
   assert(idle.body.busy === false, 'busy should clear on session.execution.succeeded');
   assert(idle.body.waiting === null, 'a resolved permission should clear the wait');
 
@@ -218,11 +246,11 @@ try {
   // Fallback path: a service that attached after the deltas went by still
   // counts characters from the full-value `*ended` boundary.
   const secondSession = 'ses_fallback';
-  await call('/watch', {
+  await call(PRIMARY_PORT, '/watch', {
     method: 'POST',
-    body: JSON.stringify({ origin: `http://127.0.0.1:${MOCK_PORT}`, sessionId: secondSession }),
+    body: JSON.stringify({ sessionId: secondSession }),
   });
-  const switched = await call('/rate');
+  const switched = await call(PRIMARY_PORT, '/rate');
   assert(switched.body.lastTurn === null, 'watching a new session should clear the last turn');
   assert(switched.body.sessionUsage === null, 'watching a new session should clear the session totals');
   await wait(300);
@@ -234,22 +262,66 @@ try {
   // A shutdown is not the end of the turn: the session stays busy.
   emit('session.execution.interrupted', { sessionID: secondSession, reason: 'shutdown' });
   await wait(50);
-  const interrupted = await call('/rate');
+  const interrupted = await call(PRIMARY_PORT, '/rate');
   assert(interrupted.body.busy === true, 'a shutdown interruption should keep the session busy');
   assert(interrupted.body.chars === 400, `expected 400 characters from the full-value boundary, got ${interrupted.body.chars}`);
 
   emit('session.execution.succeeded', { sessionID: secondSession });
   await wait(100);
-  const fallback = await call('/rate');
+  const fallback = await call(PRIMARY_PORT, '/rate');
   assert(fallback.body.busy === false, 'busy should clear after the resumed turn ends');
   assert(fallback.body.chars === 400, `expected 400 characters from the full-value boundary, got ${fallback.body.chars}`);
   assert(fallback.body.lastTurn === null, 'a turn seen only through finished parts has no timing to report');
+
+  // A host with no OpenCode access falls back to the OpenChamber proxy origin.
+  primary.kill();
+  await wait(200);
+  startService(FALLBACK_PORT);
+  await waitForHealth(FALLBACK_PORT);
+  const fallbackWatch = await call(FALLBACK_PORT, '/watch', {
+    method: 'POST',
+    body: JSON.stringify({ origin: `http://127.0.0.1:${MOCK_PORT}`, sessionId: FALLBACK_SESSION }),
+  });
+  assert(fallbackWatch.status === 200, 'the fallback watch should accept an origin');
+  const fallbackLive = await waitForLive(FALLBACK_PORT);
+  assert(fallbackLive, 'the fallback service should connect through /api/global/event');
+  emit('session.execution.started', { sessionID: FALLBACK_SESSION });
+  emit('session.text.delta', { sessionID: FALLBACK_SESSION, assistantMessageID: 'msg_f', ordinal: 0, delta: 'f'.repeat(120) });
+  await wait(100);
+  const fallbackRate = await call(FALLBACK_PORT, '/rate');
+  assert(fallbackRate.body.chars === 120, `the fallback stream should count characters, got ${fallbackRate.body.chars}`);
+  assert(
+    requested.some((entry) => entry.path === '/api/global/event'),
+    'the fallback service should use /api/global/event',
+  );
+
+  // With no URL and no origin there is nothing to read; the service says so
+  // instead of retrying forever.
+  startService(BLOCKED_PORT);
+  await waitForHealth(BLOCKED_PORT);
+  await call(BLOCKED_PORT, '/watch', {
+    method: 'POST',
+    body: JSON.stringify({ sessionId: SESSION }),
+  });
+  let blocked = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await wait(50);
+    const rateAnswer = await call(BLOCKED_PORT, '/rate');
+    if (rateAnswer.body.connection === 'blocked') {
+      blocked = rateAnswer.body;
+      break;
+    }
+  }
+  assert(blocked, 'a service with no event source should report the blocked state');
+  assert(typeof blocked.error === 'string' && blocked.error.length > 0, 'the blocked state should explain itself');
 
   console.log('turn:', JSON.stringify(turn));
   console.log('usage:', JSON.stringify(usage.body.sessionUsage));
   console.log('fallback:', JSON.stringify(fallback.body));
   console.log('smoke: ok');
 } finally {
-  child.kill();
+  for (const child of children) {
+    if (child.exitCode === null) child.kill();
+  }
   mock.close();
 }

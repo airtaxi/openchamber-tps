@@ -23,9 +23,10 @@ const COPY = {
     connecting: 'connecting',
     reconnecting: 'reconnecting',
     asleep: 'not connected',
-    serviceHint: 'The extension needs its local service. Approve it in Settings → Extensions.',
+    serviceHint: 'The extension needs its local service and OpenCode access. Approve both in Settings → Extensions.',
     disabled: 'The extension is paused in Settings → Extensions.',
-    noOrigin: 'This surface cannot reach the OpenChamber server (relay or embedded view).',
+    needsApproval: 'needs approval',
+    approvalNeeded: 'Approve OpenCode access in Settings → Extensions to measure the rate.',
     estimate: 'Tokens are estimated from streamed characters, calibrated with completed turns.',
     statusId: 'Status',
     lastEvent: 'Last event',
@@ -53,9 +54,10 @@ const COPY = {
     connecting: '연결 중',
     reconnecting: '재연결 중',
     asleep: '연결되지 않음',
-    serviceHint: '이 확장은 로컬 서비스가 필요합니다. 설정 → Extensions에서 승인해 주세요.',
+    serviceHint: '이 확장은 로컬 서비스와 OpenCode 접근이 필요합니다. 설정 → Extensions에서 둘 다 승인해 주세요.',
     disabled: '설정 → Extensions에서 확장이 일시중지되었습니다.',
-    noOrigin: '이 화면에서는 OpenChamber 서버에 접근할 수 없습니다(릴레이 또는 임베드 뷰).',
+    needsApproval: '승인 필요',
+    approvalNeeded: '설정 → Extensions에서 OpenCode 접근을 승인하면 속도를 측정합니다.',
     estimate: '토큰 수는 스트리밍된 문자 수에서 추정하고, 완료된 턴의 실제 토큰으로 보정합니다.',
     statusId: '상태',
     lastEvent: '마지막 이벤트',
@@ -122,6 +124,7 @@ const setNotice = (message: string | null, tone: 'info' | 'warning' | 'error' = 
 
 const statusLabel = (rate: RateResponse | null): { label: string; tone: 'neutral' | 'success' | 'warning' } => {
   if (!rate) return { label: copy.connecting, tone: 'neutral' };
+  if (rate.connection === 'blocked') return { label: copy.needsApproval, tone: 'warning' };
   if (rate.connection === 'error') return { label: copy.reconnecting, tone: 'warning' };
   if (rate.connection === 'connecting') return { label: copy.connecting, tone: 'neutral' };
   if (rate.connection === 'idle') return { label: copy.asleep, tone: 'neutral' };
@@ -175,7 +178,10 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
   connectionEl.textContent = rate ? rate.connection : '—';
   lastEventEl.textContent = rate ? formatAge(rate.lastEventAt) : '—';
   eventsEl.textContent = rate ? formatCount(rate.eventsSeen) : '—';
-  noteEl.textContent = rate?.error ? `${rate.error}` : copy.estimate;
+  noteEl.textContent = rate?.connection === 'blocked'
+    ? copy.approvalNeeded
+    : rate?.error ?? copy.estimate;
+  noteEl.title = rate?.error ?? '';
 
   renderLastTurn(rate);
 
@@ -187,10 +193,6 @@ let latestRate: RateResponse | null = null;
 const poll = async (): Promise<void> => {
   if (stopped) return;
   if (polling) return;
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
   polling = true;
   try {
     const result = await host.serviceRequest({ method: 'GET', path: '/rate' });
@@ -208,11 +210,7 @@ const poll = async (): Promise<void> => {
 };
 
 const configure = async (sessionId: string | null): Promise<void> => {
-  if (!origin) {
-    render(null, copy.noOrigin);
-    return;
-  }
-  const key = `${origin}|${sessionId ?? ''}`;
+  const key = `${origin ?? ''}|${sessionId ?? ''}`;
   if (key === configuredKey) return;
   try {
     await host.serviceRequest({

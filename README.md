@@ -11,10 +11,13 @@ service does the measuring.
 
 ## Requirements
 
-- OpenChamber **2.0.1** or newer (OpenCode 2.0.15+). The extension reads the
-  OpenCode 2 event stream, and the Work Status section needs 2.0.1. The 1.0.x
-  releases were the last ones for OpenChamber 1.x, where that stream had
-  different event names.
+- OpenChamber **2.7.0** or newer. The extension reads OpenCode's event stream
+  through the host's read-only **OpenCode access**
+  (`service.provides: ["opencode"]`), which is what lets it work behind a UI
+  password or a passkey.
+- Older hosts: pin **`#v1.4.0`** for OpenChamber 2.0.1–2.6.1, and **`#v1.0.1`**
+  for OpenChamber 1.x. Those releases read OpenChamber's own event proxy, so a
+  UI password blocks them.
 - Extensions load on OpenChamber web and desktop only. VS Code and the mobile
   app do not load them.
 
@@ -49,7 +52,7 @@ moved from the panel's section chooser like any other section.
 The section is a frame of its own rather than a section OpenChamber draws from
 a service answer (`statusSection.source`). Such an answer is requested with
 only the app's locale and the project directory, while the service needs the
-session and the OpenChamber origin, which only a frame can hand it.
+session, and the frame also supplies the origin for the fallback event source.
 
 ## How it measures
 
@@ -59,20 +62,34 @@ rail panel / Work Status section (sandboxed iframes)
   │  GET  /rate                          ← polled every 250 ms (panel) or 500 ms (section)
   ▼
 host loopback proxy  ──►  service process (127.0.0.1)
-                              │  GET <origin>/api/global/event   (Server-Sent Events)
+                              │  GET <OPENCHAMBER_OPENCODE_URL>/api/event   (SSE)
+                              │  Authorization: Bearer <service token>
                               ▼
-                         OpenChamber event stream
+                         host's read-only OpenCode access
+                              │  adds the managed OpenCode credential
+                              ▼
+                         OpenCode event stream
 ```
 
-The service subscribes to `GET /api/global/event`, the same global event stream
-OpenChamber's own hub reads, and counts streamed output characters for the
-watched session inside a five-second window. Two details of that stream matter:
+The service subscribes to `GET /api/event`, OpenCode 2's one event stream, and
+counts streamed output characters for the watched session inside a five-second
+window. Three details matter:
 
-- It forwards OpenCode 2 wire events (`{ id, created, type, data }`). A proxy
-  that wraps them as `{ payload, directory, eventId }` is unwrapped too.
-- `/api/event` is the directory-scoped sibling: without a `directory` parameter
-  it carries only the server's default directory, so an open project never sees
-  its own session events there. That is why the global stream is used.
+- The stream carries every project's events. OpenChamber's `/api/global/event`
+  is an alias for the same stream; OpenChamber's own hub reads it too.
+- The stream forwards OpenCode 2 wire events (`{ id, created, type, data }`). A
+  proxy that wraps them as `{ payload, directory, eventId }` is unwrapped too.
+- The service reaches the stream through OpenChamber's read-only OpenCode access
+  (`service.provides: ["opencode"]`). The host starts the service with
+  `OPENCHAMBER_OPENCODE_URL` on loopback and accepts the service token as its
+  bearer, then adds the credential for the managed OpenCode server. The service
+  never sees that credential, and no UI session is involved, so a UI password or
+  passkey does not affect the meter.
+
+A host that gives the service no such URL falls back to the panel's origin and
+`/api/global/event`. That path sits behind UI auth. It remains as a fallback for
+a host that starts the service without the URL; hosts older than 2.7.0 run the
+1.4.x releases instead.
 
 The counter itself:
 
@@ -165,14 +182,15 @@ time.
 
 Settings → Extensions → **Folder, ZIP, or URL**, paste
 `https://github.com/airtaxi/openchamber-tps`, and choose **Add**. Approve the
-permissions dialog: it includes **Run a local service**, which is what the meter
-needs. The rail icon and the Work Status section appear once it is approved.
+permissions dialog: it includes **Run a local service** and **OpenCode access**
+(read-only), which are what the meter needs. The rail icon and the Work Status
+section appear once it is approved.
 
 A Git install can update itself. Bump `version` in `package.json`, rebuild, and
 push; OpenChamber offers the update the next time Settings → Extensions is
-opened. Add `#v1.0.0` or `#main` to the URL to pin a tag or branch. On
-OpenChamber 1.x the install is refused: pin `#v1.0.1`, the last release for that
-line.
+opened. Add `#v1.5.0` or `#main` to the URL to pin a tag or branch. On
+OpenChamber 2.0.1–2.6.x the install is refused: pin `#v1.4.0`, the last release
+for that line. On 1.x pin `#v1.0.1`.
 
 To work on the extension itself, add the absolute path of your checkout
 instead. A folder install runs straight from that folder and never updates on
@@ -184,26 +202,32 @@ its own.
 node scripts/smoke.mjs
 ```
 
-The smoke test starts a mock OpenChamber event stream and the built service,
+The smoke test starts a mock OpenCode event stream and the built service,
 feeds synthetic OpenCode 2 events in the order a real stream sends them, and
 asserts the counted characters, the rolling rate, the calibration, the real
 token counts (per step and per session), the finished-turn average, the wait
-accounting, and the session filtering. It covers reasoning that arrives in one
-piece, tool input with no fragments, the delta path, the full-value `*ended`
-fallback path, `session.execution.*` status, the `shutdown` interruption, and
-the state cleared when the watched session changes.
+accounting, and the session filtering. It checks that the host access uses
+`/api/event` with the service token, that a service without that access falls
+back to `/api/global/event`, and that a service with neither source reports the
+blocked state. It covers reasoning that arrives in one piece, tool input with
+no fragments, the delta path, the full-value `*ended` fallback path,
+`session.execution.*` status, the `shutdown` interruption, and the state
+cleared when the watched session changes.
 
 ## Limitations
 
-- **OpenChamber UI password.** The service subscribes to `/api/global/event`
-  without a session. If the instance is protected with a UI password, the stream
-  answers `401` and the panel shows a reconnect notice instead of a rate.
-- **Relay frames.** Under the private relay the panel runs from `srcDoc` with no
-  usable origin, so the meter cannot discover the event stream and says so.
+- **Host version.** 1.5.0 needs OpenChamber **2.7.0** or newer for the OpenCode
+  access role. On 2.0.1–2.6.x, pin `#v1.4.0`; that release reads OpenChamber's
+  event proxy, and a UI password blocks it.
+- **Read access approval.** The service reads the listed OpenCode routes only.
+  Revoking **OpenCode access** in Settings → Extensions stops the meter until it
+  is approved again.
+- **Fallback needs UI auth.** A host that starts the service without
+  `OPENCHAMBER_OPENCODE_URL` falls back to `/api/global/event`, which answers
+  `401` when a UI password is set.
 - **Managed OpenCode auth.** OpenChamber starts its managed OpenCode server with
-  a generated password the service process never receives, which is why the
-  service reads OpenChamber's own `/api/global/event` proxy rather than OpenCode
-  directly. This is also why an instance-level UI password blocks it.
+  a generated password the service process never receives. The host's OpenCode
+  access injects it on the loopback hop, so the service reads events without it.
 - **No per-token streaming.** Deltas carry characters only. The rolling number
   stays a calibrated character estimate; real counts arrive per settled step
   (`session.step.ended`) and per session (`session.usage.updated`).

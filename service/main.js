@@ -2,6 +2,7 @@
 import http from "node:http";
 var port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 var token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? "";
+var openCodeUrl = process.env.OPENCHAMBER_OPENCODE_URL ?? "";
 if (!Number.isInteger(port) || port <= 0 || !token) {
   console.error("OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required");
   process.exit(1);
@@ -383,6 +384,18 @@ var handleSseChunk = (chunk) => {
   lastEventType = readString(event.type) || null;
   handleEvent(event, Date.now());
 };
+var ACCESS_MESSAGE = "OpenCode access is not approved. Approve the extension in Settings → Extensions.";
+var NO_STREAM_MESSAGE = "No event stream is available. Approve OpenCode access in Settings → Extensions.";
+var markBlocked = (message) => {
+  lastError = message;
+  connection = "blocked";
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  controller?.abort();
+  controller = null;
+};
 var scheduleReconnect = (message) => {
   lastError = message;
   connection = "error";
@@ -394,6 +407,21 @@ var scheduleReconnect = (message) => {
     retryTimer = null;
     startStream();
   }, delay);
+};
+var streamRequest = (current) => {
+  if (openCodeUrl) {
+    return {
+      url: new URL("/api/event", openCodeUrl),
+      headers: { Accept: "text/event-stream", Authorization: `Bearer ${token}` }
+    };
+  }
+  if (current.origin) {
+    return {
+      url: new URL("/api/global/event", current.origin),
+      headers: { Accept: "text/event-stream" }
+    };
+  }
+  return null;
 };
 var startStream = async () => {
   const current = watch;
@@ -409,11 +437,20 @@ var startStream = async () => {
   connection = "connecting";
   lastError = null;
   try {
-    const response = await fetch(new URL("/api/global/event", current.origin), {
-      headers: { Accept: "text/event-stream" },
+    const request = streamRequest(current);
+    if (!request) {
+      markBlocked(NO_STREAM_MESSAGE);
+      return;
+    }
+    const response = await fetch(request.url, {
+      headers: request.headers,
       signal: local.signal
     });
     if (!response.ok || !response.body) {
+      if (openCodeUrl && (response.status === 401 || response.status === 403)) {
+        markBlocked(ACCESS_MESSAGE);
+        return;
+      }
       scheduleReconnect(`Event stream answered HTTP ${response.status}`);
       return;
     }
@@ -533,12 +570,12 @@ var server = http.createServer((req, res) => {
     readJsonBody(req).then((raw) => {
       const body = raw && typeof raw === "object" ? raw : {};
       const origin = readString(body.origin);
-      if (!isHttpOrigin(origin)) {
+      if (origin && !isHttpOrigin(origin)) {
         json(res, 400, { error: "origin must be an http(s) origin from the OpenChamber server" });
         return;
       }
       const sessionId = typeof body.sessionId === "string" && body.sessionId.trim() ? body.sessionId : null;
-      const changed = applyWatch({ origin, sessionId });
+      const changed = applyWatch({ origin: origin || null, sessionId });
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error) => {
       json(res, 400, { error: error instanceof Error ? error.message : "Invalid request" });

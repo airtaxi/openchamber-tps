@@ -3,8 +3,8 @@
 //
 // The section stays a frame rather than a view the host draws from a service
 // answer: that answer carries only the locale and the project directory, while
-// the service needs the session and the OpenChamber origin, which only a frame
-// can hand it.
+// the service needs the session, and the frame can also hand it the OpenChamber
+// origin as a fallback event source.
 import { connectHost } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 
@@ -28,10 +28,10 @@ const COPY = {
     tokens: 'tok',
     measuring: 'measuring',
     noSession: 'No session yet. The rate shows once this chat has one.',
-    serviceHint: 'The extension needs its local service. Approve it in Settings → Extensions.',
+    serviceHint: 'The extension needs its local service and OpenCode access. Approve both in Settings → Extensions.',
     disabled: 'The extension is paused in Settings → Extensions.',
-    noOrigin: 'This surface cannot reach the OpenChamber server (relay or embedded view).',
     reconnecting: 'Reconnecting to the event stream.',
+    approvalNeeded: 'Approve OpenCode access in Settings → Extensions to measure the rate.',
     liveTip: 'Tokens per second over the last 5 seconds, estimated from streamed characters.',
     sessionTip: 'Tokens the model generated in this session, output and reasoning together.',
     charsTip: 'Streamed characters per second over the last 5 seconds, counting text, reasoning, and tool input. The live rate is computed from this measured value.',
@@ -50,10 +50,10 @@ const COPY = {
     tokens: 'tok',
     measuring: '측정 중',
     noSession: '아직 세션이 없습니다. 챗에 세션이 생기면 속도를 표시합니다.',
-    serviceHint: '이 확장은 로컬 서비스가 필요합니다. 설정 → Extensions에서 승인해 주세요.',
+    serviceHint: '이 확장은 로컬 서비스와 OpenCode 접근이 필요합니다. 설정 → Extensions에서 둘 다 승인해 주세요.',
     disabled: '설정 → Extensions에서 확장이 일시중지되었습니다.',
-    noOrigin: '이 화면에서는 OpenChamber 서버에 접근할 수 없습니다(릴레이 또는 임베드 뷰).',
     reconnecting: '이벤트 스트림에 다시 연결하는 중입니다.',
+    approvalNeeded: '설정 → Extensions에서 OpenCode 접근을 승인하면 속도를 측정합니다.',
     liveTip: '최근 5초 동안의 초당 토큰 수입니다. 스트리밍된 문자 수로 추정합니다.',
     sessionTip: '이 세션에서 모델이 생성한 토큰 수입니다. 출력과 추론을 합산합니다.',
     charsTip: '최근 5초 동안 스트리밍된 초당 문자 수입니다. 텍스트, 추론, 도구 입력을 모두 세며, 실시간 토큰 속도는 이 실측값으로 계산합니다.',
@@ -201,10 +201,6 @@ const configure = async (): Promise<void> => {
 
 const poll = async (): Promise<void> => {
   if (inflight) return;
-  if (!origin) {
-    show(copy.noOrigin, false);
-    return;
-  }
   if (!sessionId) {
     show(copy.noSession, false, null, 'muted');
     return;
@@ -222,7 +218,15 @@ const poll = async (): Promise<void> => {
     if (rate.sessionId === null && rate.connection === 'idle') configuredKey = '';
     latestRate = rate;
     render(rate);
-    show(rate.connection === 'error' ? copy.reconnecting : null, true, rate.error);
+    show(
+      rate.connection === 'blocked'
+        ? copy.approvalNeeded
+        : rate.connection === 'error'
+          ? copy.reconnecting
+          : null,
+      true,
+      rate.error,
+    );
   } catch (error) {
     show(describeHostError(error, copy), latestRate !== null);
   } finally {
