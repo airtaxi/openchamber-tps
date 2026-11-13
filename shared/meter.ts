@@ -1,9 +1,10 @@
 // What the rail panel and the Work Status section share. Both frames talk to
-// the same service: `POST /watch` names the origin and session, `GET /rate`
-// answers with the measurement below.
+// the same service: `POST /watch` names the session and the OpenChamber origin,
+// `GET /rate` answers with the measurement below. The origin is only a fallback
+// for a host that gives the service no OpenCode access of its own.
 import { HostRequestError } from '@openchamber/sdk';
 
-export type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
+export type ConnectionState = 'idle' | 'connecting' | 'live' | 'error' | 'blocked';
 
 export type TurnResult = {
   tokensPerSecond: number;
@@ -54,7 +55,7 @@ export type HostErrorCopy = {
   reconnecting: string;
 };
 
-/** The OpenChamber origin this frame was served from, which the service needs to reach the event stream. */
+/** The OpenChamber origin this frame was served from, for the service's fallback event stream. */
 export const resolveOrigin = (): string | null => {
   try {
     const url = new URL(window.location.href);

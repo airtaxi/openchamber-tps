@@ -1,9 +1,16 @@
 // OpenChamber TPS Meter service.
 //
 // Runs as the extension's local process (manifest `contributes.service`) on
-// 127.0.0.1, reachable only through the host proxy. It subscribes to the
-// OpenChamber event stream (`GET /api/global/event`, the same SSE the UI reads)
-// and derives a rolling generation rate for one session.
+// 127.0.0.1, reachable only through the host proxy. It subscribes to OpenCode's
+// event stream and derives a rolling generation rate for one session.
+//
+// The stream comes from the host's read-only OpenCode access
+// (`service.provides: ["opencode"]`). The host sets OPENCHAMBER_OPENCODE_URL to
+// a loopback address and accepts the service token as its bearer, so the
+// credential for the managed OpenCode server never reaches this process. A UI
+// password or a passkey does not affect it. A host that provides no such URL
+// falls back to the OpenChamber origin the panel sends and its
+// `/api/global/event` proxy, which is the same stream, but sits behind UI auth.
 //
 // The stream carries the OpenCode 2 wire events: text, reasoning, and tool
 // input parts (`session.text.*`, `session.reasoning.*`,
@@ -21,6 +28,7 @@ import http from 'node:http';
 
 const port = Number(process.env.OPENCHAMBER_SERVICE_PORT);
 const token = process.env.OPENCHAMBER_SERVICE_TOKEN ?? '';
+const openCodeUrl = process.env.OPENCHAMBER_OPENCODE_URL ?? '';
 if (!Number.isInteger(port) || port <= 0 || !token) {
   console.error('OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required');
   process.exit(1);
@@ -51,12 +59,13 @@ const MIN_MEASURABLE_MS = 100;
 /** How long after the last output the session still counts as generating. */
 const ACTIVE_HOLD_MS = 2_000;
 
-type ConnectionState = 'idle' | 'connecting' | 'live' | 'error';
+type ConnectionState = 'idle' | 'connecting' | 'live' | 'error' | 'blocked';
 
 type Sample = { at: number; chars: number };
 
 type WatchConfig = {
-  origin: string;
+  /** The OpenChamber origin, used only by the fallback stream. */
+  origin: string | null;
   sessionId: string | null;
 };
 
@@ -517,6 +526,24 @@ const handleSseChunk = (chunk: string): void => {
   handleEvent(event, Date.now());
 };
 
+const ACCESS_MESSAGE = 'OpenCode access is not approved. Approve the extension in Settings → Extensions.';
+const NO_STREAM_MESSAGE = 'No event stream is available. Approve OpenCode access in Settings → Extensions.';
+
+/**
+ * Stops trying until the watched session changes: a missing or withdrawn grant
+ * cannot be fixed by another request from this process.
+ */
+const markBlocked = (message: string): void => {
+  lastError = message;
+  connection = 'blocked';
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  controller?.abort();
+  controller = null;
+};
+
 const scheduleReconnect = (message: string): void => {
   lastError = message;
   connection = 'error';
@@ -527,6 +554,29 @@ const scheduleReconnect = (message: string): void => {
     retryTimer = null;
     void startStream();
   }, delay);
+};
+
+/**
+ * The host's OpenCode access when it exists. OpenCode 2 has one event stream,
+ * `/api/event`, which carries every project; OpenChamber's `/api/global/event`
+ * is an alias for it. The access carries the managed OpenCode credential, so a
+ * UI password or passkey does not matter. Without it, the panel's origin and
+ * the OpenChamber proxy are the only path left, and that one sits behind UI auth.
+ */
+const streamRequest = (current: WatchConfig): { url: URL; headers: Record<string, string> } | null => {
+  if (openCodeUrl) {
+    return {
+      url: new URL('/api/event', openCodeUrl),
+      headers: { Accept: 'text/event-stream', Authorization: `Bearer ${token}` },
+    };
+  }
+  if (current.origin) {
+    return {
+      url: new URL('/api/global/event', current.origin),
+      headers: { Accept: 'text/event-stream' },
+    };
+  }
+  return null;
 };
 
 const startStream = async (): Promise<void> => {
@@ -543,14 +593,24 @@ const startStream = async (): Promise<void> => {
   lastError = null;
 
   try {
-    // The global stream is not directory scoped. `/api/event` silently carries
-    // only the server's default directory, which is why an open project would
-    // never see its own session events there.
-    const response = await fetch(new URL('/api/global/event', current.origin), {
-      headers: { Accept: 'text/event-stream' },
+    const request = streamRequest(current);
+    if (!request) {
+      markBlocked(NO_STREAM_MESSAGE);
+      return;
+    }
+    const response = await fetch(request.url, {
+      headers: request.headers,
       signal: local.signal,
     });
     if (!response.ok || !response.body) {
+      // The host refuses the read when the grant is missing or withdrawn; a
+      // retry cannot restore it, and the panel says which approval is needed.
+      // The fallback proxy instead answers 401 for missing UI auth, which a
+      // reconnect may recover once the user signs in.
+      if (openCodeUrl && (response.status === 401 || response.status === 403)) {
+        markBlocked(ACCESS_MESSAGE);
+        return;
+      }
       scheduleReconnect(`Event stream answered HTTP ${response.status}`);
       return;
     }
@@ -676,12 +736,13 @@ const server = http.createServer((req, res) => {
     void readJsonBody(req).then((raw) => {
       const body = (raw && typeof raw === 'object' ? raw : {}) as { origin?: unknown; sessionId?: unknown };
       const origin = readString(body.origin);
-      if (!isHttpOrigin(origin)) {
+      // The fallback stream needs the origin; the host's OpenCode access does not.
+      if (origin && !isHttpOrigin(origin)) {
         json(res, 400, { error: 'origin must be an http(s) origin from the OpenChamber server' });
         return;
       }
       const sessionId = typeof body.sessionId === 'string' && body.sessionId.trim() ? body.sessionId : null;
-      const changed = applyWatch({ origin, sessionId });
+      const changed = applyWatch({ origin: origin || null, sessionId });
       json(res, 200, { ok: true, changed, connection, sessionId });
     }).catch((error: unknown) => {
       json(res, 400, { error: error instanceof Error ? error.message : 'Invalid request' });
